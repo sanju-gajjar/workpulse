@@ -1,0 +1,616 @@
+#!/usr/bin/env bash
+# ============================================================================
+# WORKPULSE CLI (workpulse)
+# ============================================================================
+# Command-line interface for interacting with the WorkPulse daemon
+# ============================================================================
+
+set -euo pipefail
+
+# Determine installation directory
+if [[ -L "${BASH_SOURCE[0]}" ]]; then
+    INSTALL_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+else
+    INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+
+# Source libraries (check both possible locations)
+if [[ -d "$INSTALL_DIR/lib" ]]; then
+    LIB_DIR="$INSTALL_DIR/lib"
+else
+    # Fallback for installed version
+    LIB_DIR="${HOME}/.local/share/workpulse/lib"
+fi
+
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/state.sh"
+source "$LIB_DIR/tracker.sh"
+source "$LIB_DIR/prompt.sh"
+source "$LIB_DIR/forcelock.sh"
+source "$LIB_DIR/reporter.sh"
+
+# ============================================================================
+# CLI CONFIGURATION
+# ============================================================================
+
+readonly CLI_NAME="workpulse"
+readonly CLI_VERSION="$WORKPULSE_VERSION"
+
+# ============================================================================
+# DAEMON COMMUNICATION
+# ============================================================================
+
+# Send command to daemon
+daemon_cmd() {
+    local cmd="$1"
+    local socket="${IPC_SOCKET:-$DEFAULT_IPC_SOCKET}"
+    local cmd_file="${socket}.cmd"
+    local resp_file="${socket}.resp"
+    
+    if [[ ! -e "$socket" ]]; then
+        echo "Error: Daemon is not running"
+        echo "Start with: workpulse daemon start"
+        exit 1
+    fi
+    
+    # Remove old response file
+    rm -f "$resp_file"
+    
+    # Write command
+    echo "$cmd" > "$cmd_file"
+    
+    # Wait for response (max 5 seconds)
+    local waited=0
+    while [[ ! -f "$resp_file" ]] && (( waited < 50 )); do
+        sleep 0.1
+        ((waited++))
+    done
+    
+    if [[ -f "$resp_file" ]]; then
+        cat "$resp_file"
+        rm -f "$resp_file"
+    else
+        echo "Error: Daemon did not respond"
+        exit 1
+    fi
+}
+
+# ============================================================================
+# COMMAND HANDLERS
+# ============================================================================
+
+# Daemon control
+cmd_daemon() {
+    local subcmd="${1:-status}"
+    shift || true
+    
+    case "$subcmd" in
+        start)
+            exec "$INSTALL_DIR/workpulsed" start
+            ;;
+        stop)
+            exec "$INSTALL_DIR/workpulsed" stop
+            ;;
+        restart)
+            exec "$INSTALL_DIR/workpulsed" restart
+            ;;
+        status)
+            exec "$INSTALL_DIR/workpulsed" status
+            ;;
+        *)
+            echo "Unknown daemon command: $subcmd"
+            echo "Usage: workpulse daemon {start|stop|restart|status}"
+            exit 1
+            ;;
+    esac
+}
+
+# Show status
+cmd_status() {
+    common_init
+    
+    echo -e "${BOLD}WorkPulse Status${NC}"
+    echo "================"
+    echo ""
+    
+    # Daemon status
+    if is_daemon_running; then
+        local pid=$(get_daemon_pid)
+        echo -e "Daemon: ${GREEN}Running${NC} (PID: $pid)"
+    else
+        echo -e "Daemon: ${RED}Stopped${NC}"
+    fi
+    echo ""
+    
+    # Current tracking
+    local current_task
+    current_task=$(get_current_task)
+    
+    if [[ -n "$current_task" ]]; then
+        local elapsed
+        elapsed=$(get_current_elapsed)
+        echo -e "Current Task: ${CYAN}$current_task${NC}"
+        echo "Elapsed: $elapsed minutes"
+    else
+        echo "Current Task: None"
+    fi
+    echo ""
+    
+    # Today's stats
+    local today_hours
+    today_hours=$(get_today_hours)
+    echo "Today's Total: ${today_hours:-0} hours"
+    echo ""
+    
+    # State info
+    local focus_mode
+    focus_mode=$(get_state "focus_mode")
+    
+    if [[ "$focus_mode" == "true" ]]; then
+        local until
+        until=$(get_state "focus_mode_until")
+        echo -e "Focus Mode: ${YELLOW}Active${NC} (until $until)"
+    else
+        echo "Focus Mode: Inactive"
+    fi
+    
+    local missed
+    missed=$(get_state "missed_prompts")
+    echo "Missed Prompts: ${missed:-0}"
+    
+    local work_hours
+    work_hours=$(get_state "consecutive_work_hours")
+    echo "Consecutive Work Hours: ${work_hours:-0}"
+}
+
+# Start tracking a task
+cmd_start() {
+    local task="$*"
+    
+    if [[ -z "$task" ]]; then
+        # Interactive mode
+        task=$(zenity --entry \
+            --title="WorkPulse - Start Task" \
+            --text="What are you working on?" \
+            --width=400 \
+            2>/dev/null) || exit 0
+    fi
+    
+    if [[ -n "$task" ]]; then
+        common_init
+        timew_start "$task"
+        set_state "current_task" "$task"
+        
+        local tags
+        tags=$(get_tags_for_task "$task")
+        
+        echo -e "${GREEN}Started tracking:${NC} $task"
+        echo "Tags: $tags"
+    fi
+}
+
+# Stop tracking
+cmd_stop() {
+    common_init
+    timew_stop
+    set_state "current_task" ""
+    echo "Stopped tracking"
+}
+
+# Continue previous task
+cmd_continue() {
+    common_init
+    timew_continue
+    echo "Continuing previous task"
+}
+
+# Log/add entry
+cmd_log() {
+    common_init
+    
+    if do_prompt; then
+        echo "Entry logged successfully"
+    else
+        echo "Entry cancelled"
+    fi
+}
+
+# Focus mode
+cmd_focus() {
+    local subcmd="${1:-start}"
+    shift || true
+    
+    common_init
+    
+    case "$subcmd" in
+        start|on)
+            local duration="${1:-}"
+            local reason="${2:-Manual focus mode}"
+            
+            if [[ -z "$duration" ]]; then
+                # Interactive
+                if start_focus_mode_interactive; then
+                    echo "Focus mode activated"
+                else
+                    echo "Focus mode cancelled"
+                fi
+            else
+                local until_time
+                until_time=$(enter_focus_mode "$duration" "$reason")
+                echo "Focus mode activated until $until_time"
+            fi
+            ;;
+        stop|off)
+            exit_focus_mode
+            echo "Focus mode deactivated"
+            ;;
+        status)
+            if is_focus_mode; then
+                local until
+                until=$(get_state "focus_mode_until")
+                echo "Focus mode is ACTIVE (until $until)"
+            else
+                echo "Focus mode is inactive"
+            fi
+            ;;
+        *)
+            echo "Usage: workpulse focus {start [duration] | stop | status}"
+            exit 1
+            ;;
+    esac
+}
+
+# Report/summary
+cmd_report() {
+    local period="${1:-today}"
+    
+    common_init
+    
+    case "$period" in
+        today|day)
+            show_time_report day
+            ;;
+        week)
+            show_time_report week
+            ;;
+        summary)
+            show_daily_summary
+            ;;
+        *)
+            show_time_report "$period"
+            ;;
+    esac
+}
+
+# Export data
+cmd_export() {
+    local format="${1:-all}"
+    local date="${2:-$(date +%Y-%m-%d)}"
+    
+    common_init
+    
+    case "$format" in
+        csv)
+            local file
+            file=$(export_to_csv "$date")
+            echo "Exported: $file"
+            ;;
+        md|markdown)
+            local file
+            file=$(export_to_markdown "$date")
+            echo "Exported: $file"
+            ;;
+        json)
+            local file
+            file=$(export_to_json "$date")
+            echo "Exported: $file"
+            ;;
+        standup)
+            local file
+            file=$(export_standup "$date")
+            echo "Standup report saved: $file"
+            echo ""
+            echo "You can copy-paste this for ClickUp/Slack/Jira:"
+            echo "================================================"
+            cat "$file"
+            ;;
+        all)
+            echo "Exporting all formats..."
+            export_all "$date" | while read -r file; do
+                echo "  Exported: $file"
+            done
+            ;;
+        *)
+            echo "Unknown format: $format"
+            echo "Usage: workpulse export {csv|md|json|standup|all} [date]"
+            exit 1
+            ;;
+    esac
+}
+
+# Config management
+cmd_config() {
+    local subcmd="${1:-show}"
+    shift || true
+    
+    common_init
+    
+    case "$subcmd" in
+        show)
+            if [[ -f "$DEFAULT_CONFIG_FILE" ]]; then
+                cat "$DEFAULT_CONFIG_FILE"
+            else
+                echo "No configuration file found"
+                echo "Default location: $DEFAULT_CONFIG_FILE"
+            fi
+            ;;
+        edit)
+            local editor="${EDITOR:-nano}"
+            if [[ ! -f "$DEFAULT_CONFIG_FILE" ]]; then
+                init_config
+            fi
+            $editor "$DEFAULT_CONFIG_FILE"
+            ;;
+        path)
+            echo "$DEFAULT_CONFIG_FILE"
+            ;;
+        reload)
+            if is_daemon_running; then
+                local pid=$(get_daemon_pid)
+                kill -HUP "$pid"
+                echo "Configuration reload signal sent"
+            else
+                echo "Daemon is not running"
+            fi
+            ;;
+        *)
+            echo "Usage: workpulse config {show|edit|path|reload}"
+            exit 1
+            ;;
+    esac
+}
+
+# Reminder frequency command
+cmd_reminder() {
+    local subcmd="${1:-show}"
+    
+    common_init
+    
+    case "$subcmd" in
+        show)
+            local countdown
+            countdown=$(get_next_prompt_countdown)
+            local frequency
+            frequency=$(get_prompt_frequency_readable)
+            
+            echo "  ${CYAN}Next Reminder:${NC} $countdown"
+            echo "  ${CYAN}Frequency:${NC}    Every $frequency"
+            ;;
+        set)
+            source "$LIB_DIR/prompt.sh"
+            local new_freq
+            new_freq=$(show_frequency_dialog)
+            
+            if [[ -n "$new_freq" ]]; then
+                set_state "prompt_frequency_minutes" "$new_freq"
+                local current_time
+                current_time=$(date +%s)
+                local next_prompt_time=$((current_time + new_freq * 60))
+                set_state "next_prompt_timestamp" "$next_prompt_time"
+                
+                local freq_readable
+                freq_readable=$(get_prompt_frequency_readable)
+                echo "${GREEN}✓${NC} Reminder frequency set to every $freq_readable"
+            else
+                echo "${RED}✗${NC} Reminder frequency not changed"
+            fi
+            ;;
+        *)
+            echo "Usage: workpulse reminder {show|set}"
+            exit 1
+            ;;
+    esac
+}
+
+# View logs
+cmd_logs() {
+    local lines="${1:-50}"
+    local log_file="$WORKPULSE_LOG_DIR/workpulse-$(date +%Y-%m-%d).log"
+    
+    if [[ -f "$log_file" ]]; then
+        tail -n "$lines" "$log_file"
+    else
+        echo "No log file for today"
+        echo "Log directory: $WORKPULSE_LOG_DIR"
+    fi
+}
+
+# Emergency unlock
+cmd_unlock() {
+    echo -e "${YELLOW}WARNING: Emergency unlock${NC}"
+    echo "This will forcibly disable force mode and re-enable all input devices."
+    
+    read -p "Are you sure? (y/N) " -n 1 -r
+    echo
+    
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        common_init
+        emergency_unlock
+        echo "Emergency unlock complete"
+    else
+        echo "Cancelled"
+    fi
+}
+
+# Test force mode (for debugging)
+cmd_test_force() {
+    echo -e "${YELLOW}Testing force mode...${NC}"
+    echo "This will trigger force mode immediately."
+    
+    read -p "Continue? (y/N) " -n 1 -r
+    echo
+    
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        common_init
+        activate_force_mode_auto
+    fi
+}
+
+# ============================================================================
+# HELP
+# ============================================================================
+
+print_help() {
+    cat << EOF
+${BOLD}WorkPulse v$CLI_VERSION${NC} - Professional Time Tracking for Linux
+
+${BOLD}USAGE:${NC}
+    workpulse <command> [options]
+
+${BOLD}COMMANDS:${NC}
+    ${CYAN}Tracking:${NC}
+      start [task]      Start tracking a task
+      stop              Stop current tracking
+      continue          Continue previous task
+      log               Open prompt dialog to log entry
+      
+    ${CYAN}Focus Mode:${NC}
+      focus start [min] Enter focus mode (optional duration in minutes)
+      focus stop        Exit focus mode
+      focus status      Check focus mode status
+      
+    ${CYAN}Reports:${NC}
+      status            Show current status
+      report [period]   Show time report (today, week, or date)
+      export [format]   Export data (csv, md, json, all)
+      
+    ${CYAN}Daemon:${NC}
+      daemon start      Start background daemon (no systemd needed)
+      daemon stop       Stop daemon
+      daemon restart    Restart daemon
+      daemon status     Check daemon status
+      
+    ${CYAN}Reminders:${NC}
+      reminder show     Show next reminder time and frequency
+      reminder set      Set reminder frequency (interactive)
+      
+    ${CYAN}Configuration:${NC}
+      config show       Show current configuration
+      config edit       Edit configuration file
+      config reload     Reload daemon configuration
+      
+    ${CYAN}Utilities:${NC}
+      logs [n]          Show last n log lines (default: 50)
+      unlock            Emergency unlock (force mode recovery)
+      version           Show version
+
+${BOLD}EXAMPLES:${NC}
+    workpulse start "Working on API endpoints"
+    workpulse focus start 60
+    workpulse export csv
+    workpulse daemon start
+
+${BOLD}CONFIGURATION:${NC}
+    Config file: ~/.config/workpulse/config
+    Data dir:    ~/.local/share/workpulse/
+    Logs:        ~/.local/share/workpulse/logs/
+
+${BOLD}SIGNALS:${NC}
+    Send to daemon (workpulsed):
+      SIGHUP   - Reload configuration
+      SIGUSR1  - Trigger immediate prompt
+      SIGUSR2  - Print status to log
+
+For more information, see: https://github.com/workpulse/workpulse
+EOF
+}
+
+print_version() {
+    echo "WorkPulse v$CLI_VERSION"
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+    
+    case "$cmd" in
+        # Tracking commands
+        start)
+            cmd_start "$@"
+            ;;
+        stop)
+            cmd_stop
+            ;;
+        continue|cont)
+            cmd_continue
+            ;;
+        log|add|prompt)
+            cmd_log
+            ;;
+            
+        # Focus mode
+        focus)
+            cmd_focus "$@"
+            ;;
+            
+        # Status and reports
+        status|st)
+            cmd_status
+            ;;
+        report|rep)
+            cmd_report "$@"
+            ;;
+        summary)
+            common_init
+            show_daily_summary
+            ;;
+        export)
+            cmd_export "$@"
+            ;;
+            
+        # Daemon control
+        daemon|d)
+            cmd_daemon "$@"
+            ;;
+            
+        # Configuration
+        config|cfg)
+            cmd_config "$@"
+            ;;
+        
+        reminder|remind)
+            cmd_reminder "$@"
+            ;;
+            
+        # Utilities
+        logs|log)
+            cmd_logs "$@"
+            ;;
+        unlock)
+            cmd_unlock
+            ;;
+        test-force)
+            cmd_test_force
+            ;;
+            
+        # Help and version
+        help|-h|--help)
+            print_help
+            ;;
+        version|-v|--version)
+            print_version
+            ;;
+            
+        *)
+            echo "Unknown command: $cmd"
+            echo "Run 'workpulse help' for usage"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

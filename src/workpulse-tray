@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""
+WorkPulse System Tray Indicator
+A floating indicator that provides quick access to WorkPulse functions.
+"""
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('AppIndicator3', '0.1')
+
+from gi.repository import Gtk, AppIndicator3, GLib
+import subprocess
+import os
+import signal
+
+class WorkPulseTray:
+    def __init__(self):
+        # Create indicator
+        self.indicator = AppIndicator3.Indicator.new(
+            "workpulse-tray",
+            "appointment-soon",
+            AppIndicator3.IndicatorCategory.APPLICATION_STATUS
+        )
+        self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+        self.indicator.set_title("WorkPulse")
+        
+        # Build menu
+        self.menu = self.build_menu()
+        self.indicator.set_menu(self.menu)
+        
+        # Update status periodically
+        GLib.timeout_add_seconds(30, self.update_status)
+        self.update_status()
+    
+    def build_menu(self):
+        menu = Gtk.Menu()
+        
+        # Status header (will be updated)
+        self.status_item = Gtk.MenuItem(label="⏱️ Loading...")
+        self.status_item.set_sensitive(False)
+        menu.append(self.status_item)
+        
+        # Current task (will be updated)
+        self.task_item = Gtk.MenuItem(label="📋 No task")
+        self.task_item.set_sensitive(False)
+        menu.append(self.task_item)
+        
+        # Today's time (will be updated)
+        self.time_item = Gtk.MenuItem(label="📊 0h today")
+        self.time_item.set_sensitive(False)
+        menu.append(self.time_item)
+        
+        menu.append(Gtk.SeparatorMenuItem())
+        
+        # Quick Start submenu
+        start_menu = Gtk.Menu()
+        quick_tasks = [
+            ("💻 Development", "Development"),
+            ("📧 Email & Communication", "Email Communication"),
+            ("📝 Documentation", "Documentation"),
+            ("🤝 Meeting", "Meeting"),
+            ("🔍 Research", "Research"),
+            ("🐛 Bug Fixing", "Bug Fixing"),
+            ("📞 Call", "Call"),
+            ("☕ Break", "Break"),
+        ]
+        for label, task in quick_tasks:
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", self.on_quick_start, task)
+            start_menu.append(item)
+        
+        start_menu.append(Gtk.SeparatorMenuItem())
+        custom_item = Gtk.MenuItem(label="✏️ Custom task...")
+        custom_item.connect("activate", self.on_custom_start)
+        start_menu.append(custom_item)
+        
+        start_submenu = Gtk.MenuItem(label="▶️ Start Tracking")
+        start_submenu.set_submenu(start_menu)
+        menu.append(start_submenu)
+        
+        # Stop
+        stop_item = Gtk.MenuItem(label="⏹️ Stop Tracking")
+        stop_item.connect("activate", self.on_stop)
+        menu.append(stop_item)
+        
+        menu.append(Gtk.SeparatorMenuItem())
+        
+        # Focus Mode submenu
+        focus_menu = Gtk.Menu()
+        
+        focus_start = Gtk.MenuItem(label="🎯 Enter Focus Mode")
+        focus_start.connect("activate", self.on_focus_start)
+        focus_menu.append(focus_start)
+        
+        focus_25 = Gtk.MenuItem(label="🍅 Pomodoro (25 min)")
+        focus_25.connect("activate", self.on_focus_pomodoro)
+        focus_menu.append(focus_25)
+        
+        focus_stop = Gtk.MenuItem(label="🔓 Exit Focus Mode")
+        focus_stop.connect("activate", self.on_focus_stop)
+        focus_menu.append(focus_stop)
+        
+        focus_submenu = Gtk.MenuItem(label="🎯 Focus Mode")
+        focus_submenu.set_submenu(focus_menu)
+        menu.append(focus_submenu)
+        
+        menu.append(Gtk.SeparatorMenuItem())
+        
+        # Reports submenu
+        reports_menu = Gtk.Menu()
+        
+        report_today = Gtk.MenuItem(label="📅 Today")
+        report_today.connect("activate", self.on_report, "today")
+        reports_menu.append(report_today)
+        
+        report_week = Gtk.MenuItem(label="📆 This Week")
+        report_week.connect("activate", self.on_report, "week")
+        reports_menu.append(report_week)
+        
+        report_summary = Gtk.MenuItem(label="📊 Summary")
+        report_summary.connect("activate", self.on_summary)
+        reports_menu.append(report_summary)
+        
+        reports_submenu = Gtk.MenuItem(label="📈 Reports")
+        reports_submenu.set_submenu(reports_menu)
+        menu.append(reports_submenu)
+        
+        # Export submenu
+        export_menu = Gtk.Menu()
+        for fmt, label in [("csv", "📄 CSV"), ("md", "📝 Markdown"), ("json", "🔧 JSON")]:
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", self.on_export, fmt)
+            export_menu.append(item)
+        
+        export_submenu = Gtk.MenuItem(label="💾 Export")
+        export_submenu.set_submenu(export_menu)
+        menu.append(export_submenu)
+        
+        menu.append(Gtk.SeparatorMenuItem())
+        
+        # Open full GUI
+        gui_item = Gtk.MenuItem(label="🖥️ Open WorkPulse")
+        gui_item.connect("activate", self.on_open_gui)
+        menu.append(gui_item)
+        
+        # Settings
+        settings_item = Gtk.MenuItem(label="⚙️ Settings")
+        settings_item.connect("activate", self.on_settings)
+        menu.append(settings_item)
+        
+        menu.append(Gtk.SeparatorMenuItem())
+        
+        # Quit
+        quit_item = Gtk.MenuItem(label="❌ Quit Tray")
+        quit_item.connect("activate", self.on_quit)
+        menu.append(quit_item)
+        
+        menu.show_all()
+        return menu
+    
+    def run_cmd(self, cmd, background=False):
+        """Run a workpulse command"""
+        try:
+            if background:
+                subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return ""
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+            return result.stdout.strip()
+        except Exception as e:
+            return f"Error: {e}"
+    
+    def update_status(self):
+        """Update the status display in menu"""
+        try:
+            status = self.run_cmd("workpulse status 2>/dev/null")
+            
+            # Parse status
+            is_running = "Running" in status
+            
+            # Extract current task
+            task = "No task"
+            for line in status.split('\n'):
+                if "Current Task:" in line:
+                    task = line.split("Current Task:")[-1].strip()
+                    if task == "None":
+                        task = "No task"
+                    break
+            
+            # Extract today's time
+            today_time = "0h"
+            for line in status.split('\n'):
+                if "Today's Total:" in line:
+                    today_time = line.split("Today's Total:")[-1].strip()
+                    break
+            
+            # Update menu items
+            if is_running:
+                self.status_item.set_label("🟢 Daemon Running")
+                self.indicator.set_icon("appointment-soon")
+            else:
+                self.status_item.set_label("🔴 Daemon Stopped")
+                self.indicator.set_icon("appointment-missed")
+            
+            if task != "No task":
+                self.task_item.set_label(f"📋 {task[:40]}...")
+                self.indicator.set_icon("media-record")  # Recording icon
+            else:
+                self.task_item.set_label("📋 Not tracking")
+            
+            self.time_item.set_label(f"📊 {today_time} today")
+            
+        except Exception as e:
+            self.status_item.set_label(f"⚠️ Error: {e}")
+        
+        return True  # Continue calling
+    
+    def notify(self, title, message):
+        """Send desktop notification"""
+        subprocess.Popen(
+            ['notify-send', '-i', 'appointment-soon', title, message],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    
+    def on_quick_start(self, widget, task):
+        self.run_cmd(f'workpulse start "{task}"')
+        self.notify("WorkPulse", f"Started: {task}")
+        self.update_status()
+    
+    def on_custom_start(self, widget):
+        # Use zenity for input
+        try:
+            result = subprocess.run(
+                ['zenity', '--entry', '--title=WorkPulse', '--text=What are you working on?', '--width=400'],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                task = result.stdout.strip()
+                self.run_cmd(f'workpulse start "{task}"')
+                self.notify("WorkPulse", f"Started: {task}")
+                self.update_status()
+        except:
+            pass
+    
+    def on_stop(self, widget):
+        self.run_cmd("workpulse stop")
+        self.notify("WorkPulse", "Tracking stopped")
+        self.update_status()
+    
+    def on_focus_start(self, widget):
+        self.run_cmd("workpulse focus start")
+        self.notify("WorkPulse", "Focus mode activated")
+    
+    def on_focus_pomodoro(self, widget):
+        self.run_cmd("workpulse focus start 25")
+        self.notify("WorkPulse", "Pomodoro started (25 min)")
+    
+    def on_focus_stop(self, widget):
+        self.run_cmd("workpulse focus stop")
+        self.notify("WorkPulse", "Focus mode deactivated")
+    
+    def on_report(self, widget, period):
+        report = self.run_cmd(f"workpulse report {period}")
+        # Show in zenity
+        subprocess.Popen(
+            ['zenity', '--text-info', '--title=WorkPulse Report', '--width=700', '--height=500', '--font=monospace'],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ).communicate(input=report.encode())
+    
+    def on_summary(self, widget):
+        self.run_cmd("workpulse-gui status", background=True)
+    
+    def on_export(self, widget, fmt):
+        result = self.run_cmd(f"workpulse export {fmt}")
+        self.notify("WorkPulse", f"Exported to {fmt.upper()}")
+    
+    def on_open_gui(self, widget):
+        self.run_cmd("workpulse-gui", background=True)
+    
+    def on_settings(self, widget):
+        config_file = os.path.expanduser("~/.config/workpulse/workpulse.conf")
+        if os.path.exists(config_file):
+            subprocess.Popen(['xdg-open', config_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            self.notify("WorkPulse", f"Config not found: {config_file}")
+    
+    def on_quit(self, widget):
+        Gtk.main_quit()
+
+def main():
+    # Handle Ctrl+C gracefully
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    
+    # Check for AppIndicator support
+    try:
+        tray = WorkPulseTray()
+        Gtk.main()
+    except Exception as e:
+        print(f"Error: {e}")
+        print("\nMake sure you have the required packages:")
+        print("  sudo apt install gir1.2-appindicator3-0.1 python3-gi")
+        return 1
+    
+    return 0
+
+if __name__ == "__main__":
+    exit(main())

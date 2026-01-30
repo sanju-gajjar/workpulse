@@ -1,0 +1,652 @@
+#!/usr/bin/env python3
+"""
+WorkPulse Floating Pie Button v2
+Features:
+- Timer display (mm:ss) instead of REC
+- Pause/Resume with task switching
+- Task history for quick resume
+- Subtle pulse animation
+- Auto-pause on idle detection
+- Break reminders after 2 hours
+"""
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gdk', '3.0')
+
+from gi.repository import Gtk, Gdk, GLib
+import cairo
+import subprocess
+import signal
+import re
+import math
+import time
+import os
+import json
+
+class WorkPulseButton(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="WorkPulse")
+        
+        # Make window transparent and borderless
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_resizable(False)
+        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        self.set_app_paintable(True)
+        
+        # Enable transparency
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+        
+        # Button size
+        self.size = 60
+        self.is_tracking = False
+        self.is_paused = False
+        self.today_hours = 0
+        self.current_task = ""
+        self.task_start_time = None
+        self.elapsed_seconds = 0
+        self.paused_tasks = []  # Stack of paused tasks
+        self.task_history = []  # Recent tasks for quick resume
+        self.history_file = os.path.expanduser("~/.local/share/workpulse/task_history.json")
+        
+        # Idle detection
+        self.last_activity_time = time.time()
+        self.idle_threshold = 300  # 5 minutes
+        self.was_idle = False
+        
+        # Break reminder
+        self.continuous_work_start = None
+        self.break_reminder_threshold = 7200  # 2 hours in seconds
+        self.last_break_reminder = 0
+        
+        # Animation
+        self.pulse_phase = 0
+        self.pulse_growing = True
+        
+        # Set window size
+        self.set_size_request(self.size, self.size)
+        
+        # Position bottom-right
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor()
+        geometry = monitor.get_geometry()
+        self.move(geometry.width - self.size - 30, geometry.height - self.size - 80)
+        
+        # Load task history
+        self.load_history()
+        
+        # Drawing area for the pie
+        self.drawing_area = Gtk.DrawingArea()
+        self.drawing_area.set_size_request(self.size, self.size)
+        self.drawing_area.connect("draw", self.on_draw)
+        self.add(self.drawing_area)
+        
+        # Mouse events
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK |
+            Gdk.EventMask.BUTTON_RELEASE_MASK |
+            Gdk.EventMask.POINTER_MOTION_MASK |
+            Gdk.EventMask.ENTER_NOTIFY_MASK |
+            Gdk.EventMask.LEAVE_NOTIFY_MASK
+        )
+        self.connect("button-press-event", self.on_button_press)
+        self.connect("button-release-event", self.on_button_release)
+        self.connect("motion-notify-event", self.on_motion)
+        self.connect("enter-notify-event", self.on_enter)
+        self.connect("leave-notify-event", self.on_leave)
+        
+        self.hover = False
+        self.drag_x = self.drag_y = 0
+        self.dragging = False
+        self.click_time = 0
+        
+        # Popup menu
+        self.menu = None  # Will be created dynamically
+        
+        # Timers
+        GLib.timeout_add(1000, self.update_timer)  # Update every second
+        GLib.timeout_add(100, self.update_animation)  # Smooth animation
+        GLib.timeout_add(30000, self.update_status)  # Sync with backend
+        GLib.timeout_add(60000, self.check_idle)  # Check idle every minute
+        GLib.timeout_add(300000, self.check_break_reminder)  # Check break every 5 min
+        
+        self.update_status()
+        self.show_all()
+    
+    def load_history(self):
+        try:
+            os.makedirs(os.path.dirname(self.history_file), exist_ok=True)
+            if os.path.exists(self.history_file):
+                with open(self.history_file, 'r') as f:
+                    data = json.load(f)
+                    self.task_history = data.get('history', [])[:10]
+                    self.paused_tasks = data.get('paused', [])
+        except:
+            self.task_history = []
+            self.paused_tasks = []
+    
+    def save_history(self):
+        try:
+            os.makedirs(os.path.dirname(self.history_file), exist_ok=True)
+            with open(self.history_file, 'w') as f:
+                json.dump({
+                    'history': self.task_history[:10],
+                    'paused': self.paused_tasks
+                }, f)
+        except:
+            pass
+    
+    def add_to_history(self, task):
+        if task and task not in self.task_history:
+            self.task_history.insert(0, task)
+            self.task_history = self.task_history[:10]
+            self.save_history()
+    
+    def create_menu(self):
+        menu = Gtk.Menu()
+        
+        # Current status header
+        if self.is_tracking:
+            status_item = Gtk.MenuItem(label=f"● {self.current_task[:25]}...")
+            status_item.set_sensitive(False)
+            menu.append(status_item)
+            
+            # Pause option
+            pause_item = Gtk.MenuItem(label="⏸ Pause & Switch Task")
+            pause_item.connect("activate", self.on_pause)
+            menu.append(pause_item)
+            
+            # Stop option
+            stop_item = Gtk.MenuItem(label="⏹ Stop")
+            stop_item.connect("activate", self.on_stop)
+            menu.append(stop_item)
+            
+            menu.append(Gtk.SeparatorMenuItem())
+        
+        # Paused tasks (resume)
+        if self.paused_tasks:
+            paused_label = Gtk.MenuItem(label="⏸ PAUSED TASKS")
+            paused_label.set_sensitive(False)
+            menu.append(paused_label)
+            
+            for task_info in self.paused_tasks[:3]:
+                task_name = task_info.get('task', 'Unknown')[:25]
+                elapsed = task_info.get('elapsed', 0)
+                mins = elapsed // 60
+                item = Gtk.MenuItem(label=f"  ▶ {task_name} ({mins}m)")
+                item.connect("activate", self.on_resume_paused, task_info)
+                menu.append(item)
+            
+            menu.append(Gtk.SeparatorMenuItem())
+        
+        # Quick start tasks
+        quick_label = Gtk.MenuItem(label="START NEW")
+        quick_label.set_sensitive(False)
+        menu.append(quick_label)
+        
+        tasks = [
+            ("  ▶ Development", "Development"),
+            ("  ▶ Meeting", "Meeting"),
+            ("  ▶ Code Review", "Code Review"),
+            ("  ▶ Research", "Research"),
+            ("  ▶ Documentation", "Documentation"),
+        ]
+        
+        for label, task in tasks:
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", self.on_quick_start, task)
+            menu.append(item)
+        
+        # Custom task
+        custom = Gtk.MenuItem(label="  ✏ Custom task...")
+        custom.connect("activate", self.on_custom_task)
+        menu.append(custom)
+        
+        # Recent tasks
+        if self.task_history:
+            menu.append(Gtk.SeparatorMenuItem())
+            recent_label = Gtk.MenuItem(label="RECENT")
+            recent_label.set_sensitive(False)
+            menu.append(recent_label)
+            
+            for task in self.task_history[:5]:
+                if task != self.current_task:
+                    item = Gtk.MenuItem(label=f"  ↻ {task[:25]}")
+                    item.connect("activate", self.on_quick_start, task)
+                    menu.append(item)
+        
+        menu.append(Gtk.SeparatorMenuItem())
+        
+        # Tools
+        report = Gtk.MenuItem(label="📋 Standup Report")
+        report.connect("activate", self.on_report)
+        menu.append(report)
+        
+        status = Gtk.MenuItem(label="📊 Status")
+        status.connect("activate", self.on_status)
+        menu.append(status)
+        
+        menu.append(Gtk.SeparatorMenuItem())
+        
+        # Quit
+        quit_item = Gtk.MenuItem(label="✕ Close Widget")
+        quit_item.connect("activate", lambda w: Gtk.main_quit())
+        menu.append(quit_item)
+        
+        menu.show_all()
+        return menu
+    
+    def on_draw(self, widget, cr):
+        width = widget.get_allocated_width()
+        height = widget.get_allocated_height()
+        center_x = width / 2
+        center_y = height / 2
+        radius = min(width, height) / 2 - 2
+        
+        # Clear background (transparent)
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        
+        # Pulse effect when tracking
+        pulse_radius = radius
+        if self.is_tracking and not self.is_paused:
+            pulse_radius = radius + (self.pulse_phase * 3)
+            # Outer glow
+            cr.set_source_rgba(0.2, 0.8, 0.5, 0.1 * (1 - self.pulse_phase))
+            cr.arc(center_x, center_y, pulse_radius + 5, 0, 2 * math.pi)
+            cr.fill()
+        
+        # Shadow
+        if self.hover:
+            cr.set_source_rgba(0, 0, 0, 0.3)
+            cr.arc(center_x + 2, center_y + 2, radius, 0, 2 * math.pi)
+            cr.fill()
+        
+        # Background circle
+        if self.is_tracking:
+            if self.is_paused:
+                # Orange when paused
+                pattern = cairo.RadialGradient(center_x - 5, center_y - 5, 0, center_x, center_y, radius)
+                pattern.add_color_stop_rgb(0, 1.0, 0.7, 0.3)
+                pattern.add_color_stop_rgb(1, 0.9, 0.5, 0.1)
+            else:
+                # Green when active
+                pattern = cairo.RadialGradient(center_x - 5, center_y - 5, 0, center_x, center_y, radius)
+                pattern.add_color_stop_rgb(0, 0.3, 0.85, 0.55)
+                pattern.add_color_stop_rgb(1, 0.15, 0.65, 0.4)
+        else:
+            # Blue when idle
+            pattern = cairo.RadialGradient(center_x - 5, center_y - 5, 0, center_x, center_y, radius)
+            pattern.add_color_stop_rgb(0, 0.35, 0.65, 0.95)
+            pattern.add_color_stop_rgb(1, 0.2, 0.5, 0.85)
+        
+        cr.set_source(pattern)
+        cr.arc(center_x, center_y, radius, 0, 2 * math.pi)
+        cr.fill()
+        
+        # Progress ring (daily progress)
+        if self.today_hours > 0:
+            progress = min(self.today_hours / 8.0, 1.0)
+            cr.set_source_rgba(1, 1, 1, 0.25)
+            cr.set_line_width(3)
+            cr.arc(center_x, center_y, radius - 3, -math.pi/2, -math.pi/2 + (2 * math.pi * progress))
+            cr.stroke()
+        
+        # Text in center
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_source_rgba(1, 1, 1, 0.95)
+        
+        if self.is_tracking:
+            # Show elapsed time mm:ss
+            mins = self.elapsed_seconds // 60
+            secs = self.elapsed_seconds % 60
+            
+            if mins >= 60:
+                hours = mins // 60
+                mins = mins % 60
+                text = f"{hours}:{mins:02d}"
+                cr.set_font_size(13)
+            else:
+                text = f"{mins}:{secs:02d}"
+                cr.set_font_size(14)
+            
+            extents = cr.text_extents(text)
+            cr.move_to(center_x - extents.width/2, center_y + extents.height/3)
+            cr.show_text(text)
+            
+            # Pause indicator
+            if self.is_paused:
+                cr.set_font_size(8)
+                cr.set_source_rgba(1, 1, 1, 0.7)
+                pause_text = "PAUSED"
+                extents = cr.text_extents(pause_text)
+                cr.move_to(center_x - extents.width/2, center_y + 18)
+                cr.show_text(pause_text)
+        else:
+            # Show total time today
+            hours = int(self.today_hours)
+            mins = int((self.today_hours - hours) * 60)
+            
+            if hours > 0:
+                text = f"{hours}h{mins:02d}"
+                cr.set_font_size(12)
+            else:
+                text = f"{mins}m"
+                cr.set_font_size(16)
+            
+            extents = cr.text_extents(text)
+            cr.move_to(center_x - extents.width/2, center_y + extents.height/3)
+            cr.show_text(text)
+        
+        # Hover ring
+        if self.hover:
+            cr.set_source_rgba(1, 1, 1, 0.2)
+            cr.set_line_width(2)
+            cr.arc(center_x, center_y, radius - 1, 0, 2 * math.pi)
+            cr.stroke()
+        
+        return False
+    
+    def update_animation(self):
+        if self.is_tracking and not self.is_paused:
+            if self.pulse_growing:
+                self.pulse_phase += 0.05
+                if self.pulse_phase >= 1:
+                    self.pulse_growing = False
+            else:
+                self.pulse_phase -= 0.05
+                if self.pulse_phase <= 0:
+                    self.pulse_growing = True
+            self.queue_draw()
+        return True
+    
+    def update_timer(self):
+        if self.is_tracking and not self.is_paused and self.task_start_time:
+            self.elapsed_seconds = int(time.time() - self.task_start_time)
+            self.queue_draw()
+        return True
+    
+    def check_idle(self):
+        """Check for system idle using xprintidle if available"""
+        try:
+            result = subprocess.run(['xprintidle'], capture_output=True, text=True, timeout=2)
+            idle_ms = int(result.stdout.strip())
+            idle_seconds = idle_ms / 1000
+            
+            if idle_seconds > self.idle_threshold:
+                if self.is_tracking and not self.is_paused and not self.was_idle:
+                    self.was_idle = True
+                    self.notify("Idle detected", f"You've been away for {int(idle_seconds/60)} min. Task paused.")
+                    self.auto_pause()
+            else:
+                if self.was_idle:
+                    self.was_idle = False
+                    if self.paused_tasks:
+                        self.notify("Welcome back!", "Click to resume your task.")
+        except:
+            pass  # xprintidle not installed
+        return True
+    
+    def check_break_reminder(self):
+        """Remind user to take a break after 2 hours"""
+        if self.is_tracking and not self.is_paused and self.continuous_work_start:
+            continuous_seconds = time.time() - self.continuous_work_start
+            
+            if continuous_seconds >= self.break_reminder_threshold:
+                # Only remind once per session
+                if time.time() - self.last_break_reminder > 1800:  # 30 min cooldown
+                    self.last_break_reminder = time.time()
+                    hours = int(continuous_seconds / 3600)
+                    mins = int((continuous_seconds % 3600) / 60)
+                    self.notify("☕ Time for a break!", 
+                               f"You've been working for {hours}h {mins}m.\nConsider taking a short break.")
+        return True
+    
+    def auto_pause(self):
+        """Auto-pause current task due to idle"""
+        if self.is_tracking and not self.is_paused:
+            self.is_paused = True
+            self.paused_tasks.insert(0, {
+                'task': self.current_task,
+                'elapsed': self.elapsed_seconds,
+                'paused_at': time.time()
+            })
+            self.save_history()
+            self.run_cmd("workpulse stop")
+            self.queue_draw()
+    
+    def on_enter(self, widget, event):
+        self.hover = True
+        self.queue_draw()
+    
+    def on_leave(self, widget, event):
+        self.hover = False
+        self.queue_draw()
+    
+    def on_button_press(self, widget, event):
+        if event.button == 1:
+            self.drag_x = event.x_root
+            self.drag_y = event.y_root
+            self.win_x, self.win_y = self.get_position()
+            self.dragging = False
+            self.click_time = time.time()
+    
+    def on_button_release(self, widget, event):
+        if event.button == 1 and not self.dragging:
+            # Check for double-click (pause toggle)
+            if time.time() - self.click_time < 0.3:
+                if self.is_tracking:
+                    self.on_pause(None)
+                    return
+            # Single click - show menu
+            self.menu = self.create_menu()
+            self.menu.popup_at_pointer(event)
+        elif event.button == 3:
+            self.menu = self.create_menu()
+            self.menu.popup_at_pointer(event)
+        self.dragging = False
+    
+    def on_motion(self, widget, event):
+        if event.state & Gdk.ModifierType.BUTTON1_MASK:
+            dx = abs(event.x_root - self.drag_x)
+            dy = abs(event.y_root - self.drag_y)
+            if dx > 5 or dy > 5:
+                self.dragging = True
+                self.move(
+                    int(self.win_x + event.x_root - self.drag_x),
+                    int(self.win_y + event.y_root - self.drag_y)
+                )
+    
+    def clean_task_name(self, task):
+        if not task:
+            return ""
+        task = re.sub(r'\+\w+', '', task)
+        task = task.replace('"', '').replace("'", "")
+        return task.strip()
+    
+    def run_cmd(self, cmd):
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+            return result.stdout.strip()
+        except:
+            return ""
+    
+    def update_status(self):
+        try:
+            status = self.run_cmd("timeout 3 workpulse status 2>/dev/null")
+            
+            # Parse task
+            task = ""
+            for line in status.split('\n'):
+                if "Current Task:" in line:
+                    task = line.split("Current Task:")[-1].strip()
+                    break
+            
+            task = self.clean_task_name(task)
+            was_tracking = self.is_tracking
+            self.is_tracking = task and task != "None"
+            
+            if self.is_tracking and not was_tracking:
+                # Just started tracking
+                self.current_task = task
+                self.task_start_time = time.time()
+                self.elapsed_seconds = 0
+                self.is_paused = False
+                self.continuous_work_start = time.time()
+                self.add_to_history(task)
+            elif not self.is_tracking:
+                self.current_task = ""
+                self.task_start_time = None
+                self.elapsed_seconds = 0
+                self.continuous_work_start = None
+            
+            # Parse today's time
+            for line in status.split('\n'):
+                if "Today's Total:" in line:
+                    time_str = line.split("Today's Total:")[-1].strip()
+                    try:
+                        self.today_hours = float(time_str.split()[0])
+                    except:
+                        self.today_hours = 0
+                    break
+            
+            self.queue_draw()
+        except:
+            pass
+        
+        return True
+    
+    def notify(self, title, msg):
+        subprocess.Popen(['notify-send', '-i', 'appointment-soon', title, msg],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    def on_quick_start(self, widget, task):
+        # If currently tracking, pause first
+        if self.is_tracking and self.current_task:
+            self.paused_tasks.insert(0, {
+                'task': self.current_task,
+                'elapsed': self.elapsed_seconds,
+                'paused_at': time.time()
+            })
+            self.save_history()
+        
+        self.run_cmd(f'workpulse start "{task}"')
+        self.current_task = task
+        self.task_start_time = time.time()
+        self.elapsed_seconds = 0
+        self.is_tracking = True
+        self.is_paused = False
+        self.continuous_work_start = time.time()
+        self.add_to_history(task)
+        self.notify("WorkPulse", f"Started: {task}")
+        self.queue_draw()
+    
+    def on_custom_task(self, widget):
+        try:
+            result = subprocess.run(
+                ['zenity', '--entry', '--title=WorkPulse', '--text=What are you working on?', '--width=350'],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                task = result.stdout.strip()
+                self.on_quick_start(None, task)
+        except:
+            pass
+    
+    def on_pause(self, widget):
+        if self.is_tracking:
+            if self.is_paused:
+                # Resume
+                self.is_paused = False
+                self.task_start_time = time.time() - self.elapsed_seconds
+                self.run_cmd(f'workpulse start "{self.current_task}"')
+                self.notify("WorkPulse", f"Resumed: {self.current_task}")
+            else:
+                # Pause
+                self.is_paused = True
+                self.paused_tasks.insert(0, {
+                    'task': self.current_task,
+                    'elapsed': self.elapsed_seconds,
+                    'paused_at': time.time()
+                })
+                self.save_history()
+                self.run_cmd("workpulse stop")
+                self.notify("WorkPulse", f"Paused: {self.current_task}")
+            self.queue_draw()
+    
+    def on_resume_paused(self, widget, task_info):
+        task = task_info.get('task', '')
+        elapsed = task_info.get('elapsed', 0)
+        
+        # Remove from paused list
+        self.paused_tasks = [t for t in self.paused_tasks if t.get('task') != task]
+        self.save_history()
+        
+        # If currently tracking, pause it
+        if self.is_tracking and self.current_task:
+            self.paused_tasks.insert(0, {
+                'task': self.current_task,
+                'elapsed': self.elapsed_seconds,
+                'paused_at': time.time()
+            })
+            self.save_history()
+        
+        # Resume the selected task
+        self.run_cmd(f'workpulse start "{task}"')
+        self.current_task = task
+        self.elapsed_seconds = elapsed
+        self.task_start_time = time.time() - elapsed
+        self.is_tracking = True
+        self.is_paused = False
+        self.continuous_work_start = time.time()
+        self.notify("WorkPulse", f"Resumed: {task}")
+        self.queue_draw()
+    
+    def on_stop(self, widget):
+        self.run_cmd("workpulse stop")
+        if self.current_task:
+            self.add_to_history(self.current_task)
+        self.is_tracking = False
+        self.is_paused = False
+        self.current_task = ""
+        self.task_start_time = None
+        self.elapsed_seconds = 0
+        self.continuous_work_start = None
+        self.notify("WorkPulse", "Tracking stopped")
+        GLib.timeout_add(500, self.update_status)
+    
+    def on_report(self, widget):
+        self.run_cmd("workpulse export standup")
+        report_file = subprocess.run(
+            "ls -t ~/.local/share/workpulse/exports/*standup*.md 2>/dev/null | head -1",
+            shell=True, capture_output=True, text=True
+        ).stdout.strip()
+        if report_file:
+            subprocess.Popen(['xdg-open', report_file], 
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    def on_status(self, widget):
+        status = self.run_cmd("timeout 3 workpulse status 2>/dev/null")
+        subprocess.Popen(['zenity', '--info', '--title=WorkPulse Status', '--text=' + status, '--width=400'],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def main():
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    try:
+        button = WorkPulseButton()
+        Gtk.main()
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+    return 0
+
+if __name__ == "__main__":
+    exit(main())

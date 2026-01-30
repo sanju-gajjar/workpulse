@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# WorkPulse GUI Launcher - A simple graphical interface using Zenity
+# Provides easy access to common WorkPulse functions
+
+set -euo pipefail
+
+# Check dependencies
+command -v zenity &>/dev/null || { echo "Error: zenity is required"; exit 1; }
+command -v workpulse &>/dev/null || { echo "Error: workpulse is not installed"; exit 1; }
+
+# Get current status info
+get_status_info() {
+    local status
+    status=$(workpulse status 2>/dev/null || echo "Daemon not running")
+    echo "$status"
+}
+
+# Show notification
+notify() {
+    local title="$1"
+    local msg="$2"
+    notify-send -i appointment-soon "$title" "$msg" 2>/dev/null || true
+}
+
+# Main menu
+show_main_menu() {
+    local status_text
+    status_text=$(get_status_info)
+    
+    local current_task="None"
+    if echo "$status_text" | grep -q "Current Task:"; then
+        current_task=$(echo "$status_text" | grep "Current Task:" | sed 's/Current Task: //')
+    fi
+    
+    local choice
+    choice=$(zenity --list \
+        --title="WorkPulse - Time Tracker" \
+        --text="<b>Current Task:</b> $current_task\n\nSelect an action:" \
+        --column="Action" --column="Description" \
+        --width=450 --height=400 \
+        "start" "Start tracking a new task" \
+        "stop" "Stop current tracking" \
+        "status" "View detailed status" \
+        "report" "View today's report" \
+        "focus" "Toggle focus mode" \
+        "log" "Quick log entry" \
+        "export" "Export time data" \
+        "settings" "Open settings" \
+        2>/dev/null) || exit 0
+    
+    case "$choice" in
+        start) show_start_dialog ;;
+        stop) do_stop ;;
+        status) show_status_dialog ;;
+        report) show_report_dialog ;;
+        focus) show_focus_menu ;;
+        log) show_log_dialog ;;
+        export) show_export_menu ;;
+        settings) open_settings ;;
+    esac
+}
+
+# Start tracking dialog
+show_start_dialog() {
+    local task
+    task=$(zenity --entry \
+        --title="Start Tracking" \
+        --text="What are you working on?" \
+        --width=400 \
+        2>/dev/null) || return
+    
+    if [[ -n "$task" ]]; then
+        workpulse start "$task" 2>/dev/null
+        notify "WorkPulse" "Started tracking: $task"
+    fi
+}
+
+# Stop tracking
+do_stop() {
+    workpulse stop 2>/dev/null
+    notify "WorkPulse" "Tracking stopped"
+}
+
+# Status dialog
+show_status_dialog() {
+    local status
+    status=$(get_status_info)
+    
+    zenity --info \
+        --title="WorkPulse Status" \
+        --text="$status" \
+        --width=400 \
+        --height=300 \
+        2>/dev/null || true
+}
+
+# Report dialog
+show_report_dialog() {
+    local report
+    report=$(workpulse report today 2>/dev/null || echo "No data for today")
+    
+    zenity --text-info \
+        --title="Today's Time Report" \
+        --width=600 \
+        --height=400 \
+        --font="monospace" \
+        2>/dev/null <<< "$report" || true
+}
+
+# Focus mode menu
+show_focus_menu() {
+    local choice
+    choice=$(zenity --list \
+        --title="Focus Mode" \
+        --text="Focus mode blocks distractions and enables strict tracking." \
+        --column="Action" --column="Description" \
+        --width=400 --height=250 \
+        "start" "Enter focus mode" \
+        "stop" "Exit focus mode" \
+        "status" "Check focus status" \
+        2>/dev/null) || return
+    
+    case "$choice" in
+        start)
+            local duration
+            duration=$(zenity --entry \
+                --title="Focus Duration" \
+                --text="Duration in minutes (leave empty for unlimited):" \
+                --width=300 \
+                2>/dev/null) || return
+            
+            if [[ -n "$duration" ]]; then
+                workpulse focus start "$duration" 2>/dev/null
+            else
+                workpulse focus start 2>/dev/null
+            fi
+            notify "WorkPulse" "Focus mode activated"
+            ;;
+        stop)
+            workpulse focus stop 2>/dev/null
+            notify "WorkPulse" "Focus mode deactivated"
+            ;;
+        status)
+            local status
+            status=$(workpulse focus status 2>/dev/null || echo "Focus mode inactive")
+            zenity --info --title="Focus Status" --text="$status" 2>/dev/null
+            ;;
+    esac
+}
+
+# Quick log dialog
+show_log_dialog() {
+    local entry
+    entry=$(zenity --entry \
+        --title="Quick Log Entry" \
+        --text="Log what you just worked on:" \
+        --width=400 \
+        2>/dev/null) || return
+    
+    if [[ -n "$entry" ]]; then
+        workpulse start "$entry" 2>/dev/null
+        sleep 1
+        workpulse stop 2>/dev/null
+        notify "WorkPulse" "Logged: $entry"
+    fi
+}
+
+# Export menu
+show_export_menu() {
+    local format
+    format=$(zenity --list \
+        --title="Export Data" \
+        --text="Select export format:" \
+        --column="Format" --column="Description" \
+        --width=400 --height=250 \
+        "csv" "CSV spreadsheet format" \
+        "md" "Markdown format" \
+        "json" "JSON format" \
+        "all" "All formats" \
+        2>/dev/null) || return
+    
+    local output
+    output=$(workpulse export "$format" 2>&1)
+    
+    zenity --info \
+        --title="Export Complete" \
+        --text="$output" \
+        --width=400 \
+        2>/dev/null || true
+}
+
+# Open settings
+open_settings() {
+    local config_file="${XDG_CONFIG_HOME:-$HOME/.config}/workpulse/workpulse.conf"
+    
+    if [[ -f "$config_file" ]]; then
+        if command -v xdg-open &>/dev/null; then
+            xdg-open "$config_file" 2>/dev/null &
+        else
+            zenity --text-info \
+                --title="WorkPulse Configuration" \
+                --filename="$config_file" \
+                --editable \
+                --width=600 \
+                --height=500 \
+                2>/dev/null > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+        fi
+    else
+        zenity --warning \
+            --title="Configuration" \
+            --text="Config file not found at:\n$config_file\n\nRun 'workpulse config show' to create one." \
+            2>/dev/null
+    fi
+}
+
+# Handle command line arguments for desktop actions
+case "${1:-}" in
+    status)
+        show_status_dialog
+        ;;
+    start)
+        show_start_dialog
+        ;;
+    stop)
+        do_stop
+        ;;
+    report)
+        show_report_dialog
+        ;;
+    focus)
+        show_focus_menu
+        ;;
+    ""|menu)
+        show_main_menu
+        ;;
+    *)
+        show_main_menu
+        ;;
+esac

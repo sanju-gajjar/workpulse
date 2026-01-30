@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=WorkPulse Mascot
+Comment=Animated time tracking companion
+Exec=workpulse-mascot
+Icon=appointment-soon
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=3

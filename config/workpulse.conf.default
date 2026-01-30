@@ -1,0 +1,114 @@
+# ============================================================================
+# WORKPULSE CONFIGURATION
+# ============================================================================
+# Copy this file to ~/.config/workpulse/config
+# All times are in 24-hour format (HH:MM)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# WORKING HOURS
+# ----------------------------------------------------------------------------
+# Application is active only within this window
+WORK_START="10:00"
+WORK_END="19:30"
+
+# ----------------------------------------------------------------------------
+# PROMPT SETTINGS
+# ----------------------------------------------------------------------------
+# Interval between prompts (in minutes)
+PROMPT_INTERVAL=60
+
+# Notification timeout before showing dialog (seconds)
+NOTIFICATION_TIMEOUT=30
+
+# Grace period after prompt before counting as missed (seconds)
+PROMPT_GRACE_PERIOD=300
+
+# ----------------------------------------------------------------------------
+# FORCE MODE TRIGGERS
+# ----------------------------------------------------------------------------
+# Consecutive missed prompts before force mode activates
+FORCE_MODE_MISSED_THRESHOLD=3
+
+# Minimum continuous work hours before force mode can trigger
+FORCE_MODE_MIN_HOURS=3
+
+# Force mode cannot be dismissed until input is provided
+FORCE_MODE_MANDATORY=true
+
+# ----------------------------------------------------------------------------
+# FOCUS MODE
+# ----------------------------------------------------------------------------
+# Default focus mode duration (minutes)
+FOCUS_MODE_DEFAULT_DURATION=60
+
+# Maximum focus mode duration (minutes)
+FOCUS_MODE_MAX_DURATION=180
+
+# Auto-exit focus mode when work hours end
+FOCUS_MODE_AUTO_EXIT=true
+
+# ----------------------------------------------------------------------------
+# TIMEWARRIOR INTEGRATION
+# ----------------------------------------------------------------------------
+# Enable timewarrior integration
+TIMEWARRIOR_ENABLED=true
+
+# Auto-tag keywords (case-insensitive matching)
+# Format: "keyword:tag,keyword:tag,..."
+AUTO_TAGS="meeting:+meeting,standup:+meeting,sync:+meeting,code:+dev,coding:+dev,develop:+dev,review:+review,pr:+review,ops:+ops,support:+ops,debug:+dev,test:+dev,deploy:+ops,docs:+docs,documentation:+docs"
+
+# Default tag when no keyword matches
+DEFAULT_TAG="+work"
+
+# ----------------------------------------------------------------------------
+# DAILY SUMMARY
+# ----------------------------------------------------------------------------
+# Time to show daily summary (should be at or after WORK_END)
+SUMMARY_TIME="19:30"
+
+# Export formats (comma-separated: csv,md,json)
+EXPORT_FORMATS="csv,md"
+
+# Export directory
+EXPORT_DIR="$HOME/.local/share/workpulse/exports"
+
+# ----------------------------------------------------------------------------
+# UI SETTINGS
+# ----------------------------------------------------------------------------
+# Dialog width and height
+DIALOG_WIDTH=500
+DIALOG_HEIGHT=400
+
+# Force mode overlay opacity (0.0 - 1.0)
+FORCE_OVERLAY_OPACITY=0.85
+
+# Theme (light/dark/auto)
+UI_THEME="auto"
+
+# ----------------------------------------------------------------------------
+# LOGGING
+# ----------------------------------------------------------------------------
+# Log level: DEBUG, INFO, WARN, ERROR
+LOG_LEVEL="INFO"
+
+# Log retention (days)
+LOG_RETENTION_DAYS=30
+
+# Maximum log file size (MB)
+LOG_MAX_SIZE_MB=10
+
+# ----------------------------------------------------------------------------
+# SYSTEM
+# ----------------------------------------------------------------------------
+# PID file location
+PID_FILE="$HOME/.local/share/workpulse/workpulse.pid"
+
+# State file location
+STATE_FILE="$HOME/.local/share/workpulse/state.json"
+
+# Database file
+DB_FILE="$HOME/.local/share/workpulse/prompts.db"
+
+# Socket for IPC
+IPC_SOCKET="$HOME/.local/share/workpulse/workpulse.sock"

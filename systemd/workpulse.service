@@ -1,0 +1,33 @@
+[Unit]
+Description=WorkPulse Time Tracking Daemon
+Documentation=https://github.com/workpulse/workpulse
+After=graphical-session.target
+Wants=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/workpulsed foreground
+ExecStop=/bin/kill -TERM $MAINPID
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Environment
+Environment=DISPLAY=:0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=workpulse
+
+# Security hardening (user service, minimal restrictions)
+PrivateTmp=false
+NoNewPrivileges=false
+ProtectSystem=false
+ProtectHome=false
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,1651 @@
+#!/usr/bin/env python3
+"""
+WorkPulse Animated Mascot v2.1
+A cute cartoon character that floats on screen with random animations.
+Features:
+- Random activities: thinking, working, running, jumping, waving, sleeping
+- Timer display when tracking
+- Same click functionality as pie button
+- Draggable around screen
+- Personalized speech bubbles and greetings
+- Customizable mascot and user names
+- Multiple mascot themes (Blob, Robot, Cat, Astronaut)
+- End-of-day standup reminder
+- Git activity detection and celebration
+- Sleepy mode when idle
+"""
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gdk', '3.0')
+
+from gi.repository import Gtk, Gdk, GLib
+
+# Check if we can initialize GTK (need display access)
+if not Gtk.init_check()[0]:
+    import sys
+    print("Cannot initialize GTK - no display available.", file=sys.stderr)
+    print("Please run from a graphical session.", file=sys.stderr)
+    sys.exit(1)
+
+import cairo
+import subprocess
+import signal
+import re
+import math
+import time
+import os
+import json
+import random
+import threading
+import sys
+
+# Add the appropriate directory to Python path
+# Try local development path first, fall back to installed location
+script_dir = os.path.dirname(os.path.abspath(__file__))
+# script_dir is /path/to/src when running python3 src/workpulse-mascot
+if os.path.exists(os.path.join(script_dir, 'mascot_lib')):
+    sys.path.insert(0, script_dir)
+else:
+    sys.path.insert(0, '/usr/share/workpulse')
+
+# Import mascot character and themes
+from mascot_lib.character import MascotTheme, MascotCharacter
+from mascot_lib.notifications import NotificationListener
+from mascot_lib.monitors import GitActivityMonitor, MeetingDetector
+from mascot_lib.speech import SpeechBubble
+
+# Try to import dbus for notification listening
+try:
+    import dbus
+    from dbus.mainloop.glib import DBusGMainLoop
+    HAS_DBUS = True
+except ImportError:
+    HAS_DBUS = False
+
+
+class WorkPulseMascot(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="WorkPulse Mascot")
+        
+        # Make window transparent and borderless
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_resizable(False)
+        # Use DOCK type hint for always-on-top behavior on Wayland
+        self.set_type_hint(Gdk.WindowTypeHint.DOCK)
+        self.set_app_paintable(True)
+        # Don't accept focus to avoid interfering with other windows
+        self.set_accept_focus(False)
+        
+        # Enable transparency
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+        
+        # Character size (configurable: small=60, medium=90, large=120)
+        self.size = 90  # Default medium
+        self.size_name = "medium"  # small, medium, large
+        self.bubble_height = 100  # Extra space for speech bubble (up to 4 lines)
+        self.is_tracking = False
+        self.is_paused = False
+        self.today_hours = 0
+        self.current_task = ""
+        self.task_start_time = None
+        self.elapsed_seconds = 0
+        self.paused_tasks = []
+        self.task_history = []
+        self.history_file = os.path.expanduser("~/.local/share/workpulse/task_history.json")
+        self.settings_file = os.path.expanduser("~/.local/share/workpulse/mascot_settings.json")
+        
+        # Personalization settings
+        self.mascot_name = "KIKI"  # Default mascot name
+        self.user_name = "sanju"    # Default user name
+        self.mascot_theme = "blob"  # Default theme
+        self.eod_reminder_hour = 17  # Default 5 PM
+        self.eod_reminder_minute = 30  # Default 5:30 PM
+        self.show_system_notifications = True  # Show system notifications
+        self.show_all_notifications = False    # Only priority apps by default
+        
+        # Custom scheduled reminders (list of {"time": "HH:MM", "message": "text"})
+        self.scheduled_reminders = []
+        self.triggered_reminders_today = set()  # Track which reminders fired today
+        
+        # Meeting call detection
+        self.auto_track_meetings = True  # Enable automatic meeting tracking
+        self.in_meeting = False
+        self.meeting_app = None
+        self.meeting_task_name = None
+        
+        self.load_settings()
+        
+        # Speech bubble system
+        self.speech_bubble = SpeechBubble(self.user_name)
+        self.just_started = True  # For initial greeting
+        
+        # Notification listener (for system notifications)
+        self.notification_listener = NotificationListener(self._on_system_notification)
+        if HAS_DBUS and self.show_system_notifications:
+            self.notification_listener.start()
+        
+        # Git activity monitor
+        self.git_monitor = GitActivityMonitor()
+        
+        # Sleepy mode tracking
+        self.idle_start_time = time.time()
+        self.sleepy_threshold = 600  # 10 minutes idle = sleepy mode
+        self.is_sleepy = False
+        
+        # End of day reminder
+        self.eod_reminded_today = False
+        self.last_eod_check_date = None
+        
+        # Idle detection
+        self.last_activity_time = time.time()
+        self.idle_threshold = 300
+        self.was_idle = False
+        
+        # Break reminder
+        self.continuous_work_start = None
+        self.break_reminder_threshold = 7200
+        self.last_break_reminder = 0
+        
+        # The mascot character
+        self.mascot = MascotCharacter(self.mascot_theme)
+        self.mascot.tamagotchi = True
+        
+        # Set window size (bigger for character + speech bubble)
+        self.set_size_request(self.size + 80, self.size + self.bubble_height + 30)
+        
+        # Position bottom-right
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor()
+        if monitor is None:
+            # Fallback: get first monitor
+            monitor = display.get_monitor(0)
+        if monitor is not None:
+            geometry = monitor.get_geometry()
+            self.move(geometry.width - self.size - 80, geometry.height - self.size - 140)
+        else:
+            # Ultimate fallback: use screen dimensions
+            screen = self.get_screen()
+            self.move(screen.get_width() - self.size - 80, screen.get_height() - self.size - 140)
+        
+        # Load task history
+        self.load_history()
+        
+        # Drawing area
+        self.drawing_area = Gtk.DrawingArea()
+        self.drawing_area.set_size_request(self.size + 80, self.size + self.bubble_height + 30)
+        self.drawing_area.connect("draw", self.on_draw)
+        
+        # Mouse events - connect to drawing area to receive input
+        self.drawing_area.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK |
+            Gdk.EventMask.BUTTON_RELEASE_MASK |
+            Gdk.EventMask.POINTER_MOTION_MASK |
+            Gdk.EventMask.ENTER_NOTIFY_MASK |
+            Gdk.EventMask.LEAVE_NOTIFY_MASK
+        )
+        self.drawing_area.connect("button-press-event", self.on_button_press)
+        self.drawing_area.connect("button-release-event", self.on_button_release)
+        self.drawing_area.connect("motion-notify-event", self.on_motion)
+        self.drawing_area.connect("enter-notify-event", self.on_enter)
+        self.drawing_area.connect("leave-notify-event", self.on_leave)
+        
+        self.add(self.drawing_area)
+        
+        self.hover = False
+        self.drag_x = self.drag_y = 0
+        self.dragging = False
+        self.click_time = 0
+        
+        # Popup menu
+        self.menu = None
+        
+        # Timers
+        GLib.timeout_add(50, self.update_animation)  # 20 FPS for smooth animation
+        GLib.timeout_add(1000, self.update_timer)
+        GLib.timeout_add(30000, self.update_status)
+        GLib.timeout_add(60000, self.check_idle)
+        GLib.timeout_add(300000, self.check_break_reminder)
+        GLib.timeout_add(30000, self.check_git_activity)  # Check git every 30s
+        GLib.timeout_add(60000, self.check_eod_reminder)  # Check EOD every minute
+        GLib.timeout_add(30000, self.check_sleepy_mode)   # Check sleepy every 30s
+        GLib.timeout_add(5000, self.ensure_on_top)  # Keep window on top every 5s
+        GLib.timeout_add(10000, self.check_meeting_call)  # Check for meeting calls every 10s
+        
+        self.update_status()
+        self.show_all()
+        
+        # Ensure window is on top after it's realized
+        self.connect("realize", self._on_realize)
+        
+        # Show initial greeting after a short delay
+        GLib.timeout_add(2000, self._show_initial_greeting)
+    
+    def _on_realize(self, widget):
+        """Called when window is realized - ensure it's on top"""
+        self.ensure_on_top()
+    
+    def ensure_on_top(self):
+        """Periodically ensure window stays on top"""
+        try:
+            window = self.get_window()
+            if window:
+                # Re-assert keep_above for Wayland/X11
+                self.set_keep_above(True)
+                # Raise to top of stacking order
+                window.raise_()
+        except:
+            pass
+        return True  # Continue timer
+    
+    def _show_initial_greeting(self):
+        """Show greeting when mascot first starts"""
+        if self.just_started:
+            self.speech_bubble.set_message(self.speech_bubble.get_time_based_greeting())
+            self.just_started = False
+        return False  # Don't repeat
+    
+    def _on_system_notification(self, text, app_name):
+        """Callback when a system notification is received"""
+        if self.show_system_notifications:
+            self.speech_bubble.set_message(text)
+            # Wake up if sleepy
+            if self.is_sleepy:
+                self.is_sleepy = False
+                self.mascot.set_sleepy(False)
+    
+    def load_settings(self):
+        """Load personalization settings"""
+        try:
+            os.makedirs(os.path.dirname(self.settings_file), exist_ok=True)
+            if os.path.exists(self.settings_file):
+                with open(self.settings_file, 'r') as f:
+                    data = json.load(f)
+                    self.mascot_name = data.get('mascot_name', 'KIKI')
+                    self.user_name = data.get('user_name', 'sanju')
+                    self.mascot_theme = data.get('mascot_theme', 'blob')
+                    self.eod_reminder_hour = data.get('eod_reminder_hour', 17)
+                    self.eod_reminder_minute = data.get('eod_reminder_minute', 30)
+                    self.show_system_notifications = data.get('show_system_notifications', True)
+                    self.show_all_notifications = data.get('show_all_notifications', False)
+                    # Size setting
+                    self.size_name = data.get('size', 'medium')
+                    self._apply_size()
+                    # Custom scheduled reminders
+                    self.scheduled_reminders = data.get('scheduled_reminders', [])
+                    # Auto-track meetings
+                    self.auto_track_meetings = data.get('auto_track_meetings', True)
+        except:
+            pass
+    
+    def _apply_size(self):
+        """Apply size based on size_name"""
+        sizes = {'small': 60, 'medium': 90, 'large': 120}
+        self.size = sizes.get(self.size_name, 90)
+        # Increased bubble height to accommodate up to 4 lines of text
+        self.bubble_height = 80 if self.size_name == 'small' else 100
+    
+    def save_settings(self):
+        """Save personalization settings"""
+        try:
+            os.makedirs(os.path.dirname(self.settings_file), exist_ok=True)
+            with open(self.settings_file, 'w') as f:
+                json.dump({
+                    'mascot_name': self.mascot_name,
+                    'user_name': self.user_name,
+                    'mascot_theme': self.mascot_theme,
+                    'eod_reminder_hour': self.eod_reminder_hour,
+                    'eod_reminder_minute': self.eod_reminder_minute,
+                    'show_system_notifications': self.show_system_notifications,
+                    'show_all_notifications': self.show_all_notifications,
+                    'size': self.size_name,
+                    'scheduled_reminders': self.scheduled_reminders,
+                    'auto_track_meetings': self.auto_track_meetings
+                }, f, indent=2)
+            # Update speech bubble with new name
+            self.speech_bubble.set_user_name(self.user_name)
+            # Update mascot theme
+            self.mascot.set_theme(self.mascot_theme)
+            # Update notification listener
+            if hasattr(self, 'notification_listener'):
+                self.notification_listener.set_enabled(self.show_system_notifications)
+                self.notification_listener.set_show_all(self.show_all_notifications)
+        except:
+            pass
+    
+    def load_history(self):
+        try:
+            os.makedirs(os.path.dirname(self.history_file), exist_ok=True)
+            if os.path.exists(self.history_file):
+                with open(self.history_file, 'r') as f:
+                    data = json.load(f)
+                    self.task_history = data.get('history', [])[:10]
+                    self.paused_tasks = data.get('paused', [])
+        except:
+            self.task_history = []
+            self.paused_tasks = []
+    
+    def save_history(self):
+        try:
+            os.makedirs(os.path.dirname(self.history_file), exist_ok=True)
+            with open(self.history_file, 'w') as f:
+                json.dump({
+                    'history': self.task_history[:10],
+                    'paused': self.paused_tasks
+                }, f)
+        except:
+            pass
+    
+    def add_to_history(self, task):
+        if task and task not in self.task_history:
+            self.task_history.insert(0, task)
+            self.task_history = self.task_history[:10]
+            self.save_history()
+    
+    def remove_from_history(self, task):
+        """Remove a task from recent history"""
+        if task in self.task_history:
+            self.task_history.remove(task)
+            self.save_history()
+    
+    def clear_all_history(self):
+        """Clear all recent task history"""
+        self.task_history = []
+        self.save_history()
+    
+    def remove_paused_task(self, task_info):
+        """Remove a task from paused tasks list"""
+        task = task_info.get('task', '')
+        self.paused_tasks = [t for t in self.paused_tasks if t.get('task') != task]
+        self.save_history()
+    
+    def clear_all_paused(self):
+        """Clear all paused tasks"""
+        self.paused_tasks = []
+        self.save_history()
+    
+    def create_menu(self):
+        menu = Gtk.Menu()
+        
+        # Make menu close when clicking outside
+        menu.connect("deactivate", self._on_menu_deactivate)
+        
+        # Current status header
+        if self.is_tracking:
+            status_item = Gtk.MenuItem(label=f"● {self.current_task[:25]}...")
+            status_item.set_sensitive(False)
+            menu.append(status_item)
+            
+            pause_item = Gtk.MenuItem(label="⏸ Pause & Switch Task")
+            pause_item.connect("activate", lambda w: self._menu_action(self.on_pause))
+            menu.append(pause_item)
+            
+            stop_item = Gtk.MenuItem(label="⏹ Stop")
+            stop_item.connect("activate", lambda w: self._menu_action(self.on_stop))
+            menu.append(stop_item)
+            
+            menu.append(Gtk.SeparatorMenuItem())
+        
+        # Paused tasks
+        if self.paused_tasks:
+            paused_label = Gtk.MenuItem(label="⏸ PAUSED TASKS")
+            paused_label.set_sensitive(False)
+            menu.append(paused_label)
+            
+            for task_info in self.paused_tasks[:5]:
+                task_name = task_info.get('task', 'Unknown')[:20]
+                elapsed = task_info.get('elapsed', 0)
+                mins = elapsed // 60
+                
+                # Resume item
+                item = Gtk.MenuItem(label=f"  ▶ {task_name} ({mins}m)")
+                item.connect("activate", lambda w, ti=task_info: self._menu_action(lambda: self.on_resume_paused(None, ti)))
+                menu.append(item)
+                
+                # Remove item (indented with x)
+                remove_item = Gtk.MenuItem(label=f"      ✕ Remove")
+                remove_item.connect("activate", lambda w, ti=task_info: self._menu_action(lambda: self.remove_paused_task(ti)))
+                menu.append(remove_item)
+            
+            # Clear all paused tasks option
+            if len(self.paused_tasks) > 1:
+                menu.append(Gtk.SeparatorMenuItem())
+                clear_paused = Gtk.MenuItem(label="  🗑 Clear all paused")
+                clear_paused.connect("activate", lambda w: self._menu_action(self.clear_all_paused))
+                menu.append(clear_paused)
+            
+            menu.append(Gtk.SeparatorMenuItem())
+        
+        # Quick start tasks
+        quick_label = Gtk.MenuItem(label="START NEW")
+        quick_label.set_sensitive(False)
+        menu.append(quick_label)
+        
+        tasks = [
+            ("  ▶ Development", "Development"),
+            ("  ▶ Meeting", "Meeting"),
+            ("  ▶ Code Review", "Code Review"),
+            ("  ▶ Research", "Research"),
+            ("  ▶ Documentation", "Documentation"),
+        ]
+        
+        for label, task in tasks:
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", lambda w, t=task: self._menu_action(lambda: self.on_quick_start(None, t)))
+            menu.append(item)
+        
+        custom = Gtk.MenuItem(label="  ✏ Custom task...")
+        custom.connect("activate", lambda w: self._menu_action(self.on_custom_task))
+        menu.append(custom)
+        
+        # Recent tasks
+        if self.task_history:
+            menu.append(Gtk.SeparatorMenuItem())
+            recent_label = Gtk.MenuItem(label="RECENT")
+            recent_label.set_sensitive(False)
+            menu.append(recent_label)
+            
+            for task in self.task_history[:5]:
+                if task != self.current_task:
+                    # Start task item
+                    item = Gtk.MenuItem(label=f"  ↻ {task[:20]}")
+                    item.connect("activate", lambda w, t=task: self._menu_action(lambda: self.on_quick_start(None, t)))
+                    menu.append(item)
+                    
+                    # Remove item
+                    remove_item = Gtk.MenuItem(label=f"      ✕ Remove")
+                    remove_item.connect("activate", lambda w, t=task: self._menu_action(lambda: self.remove_from_history(t)))
+                    menu.append(remove_item)
+            
+            # Clear all recent tasks option
+            if len(self.task_history) > 1:
+                menu.append(Gtk.SeparatorMenuItem())
+                clear_recent = Gtk.MenuItem(label="  🗑 Clear all recent")
+                clear_recent.connect("activate", lambda w: self._menu_action(self.clear_all_history))
+                menu.append(clear_recent)
+        
+        menu.append(Gtk.SeparatorMenuItem())
+        
+        # Report submenu with copy option
+        report_menu = Gtk.Menu()
+        report_item = Gtk.MenuItem(label="📋 Standup Report")
+        report_item.set_submenu(report_menu)
+        
+        report_view = Gtk.MenuItem(label="  📄 View Report")
+        report_view.connect("activate", lambda w: self._menu_action(self.on_report))
+        report_menu.append(report_view)
+        
+        report_copy = Gtk.MenuItem(label="  📋 Copy to Clipboard")
+        report_copy.connect("activate", lambda w: self._menu_action(self.on_copy_report))
+        report_menu.append(report_copy)
+        
+        menu.append(report_item)
+        
+        status = Gtk.MenuItem(label="📊 Status")
+        status.connect("activate", lambda w: self._menu_action(self.on_status))
+        menu.append(status)
+        
+        menu.append(Gtk.SeparatorMenuItem())
+        
+        # Settings submenu
+        settings_menu = Gtk.Menu()
+        theme_info = MascotTheme.get_theme(self.mascot_theme)
+        settings_item = Gtk.MenuItem(label=f"⚙ Settings ({self.mascot_name} {theme_info['icon']})")
+        settings_item.set_submenu(settings_menu)
+        
+        name_mascot = Gtk.MenuItem(label=f"  🎭 Mascot name: {self.mascot_name}")
+        name_mascot.connect("activate", lambda w: self._menu_action(self.on_set_mascot_name))
+        settings_menu.append(name_mascot)
+        
+        name_user = Gtk.MenuItem(label=f"  👤 Call me: {self.user_name}")
+        name_user.connect("activate", lambda w: self._menu_action(self.on_set_user_name))
+        settings_menu.append(name_user)
+        
+        settings_menu.append(Gtk.SeparatorMenuItem())
+        
+        # Theme submenu
+        theme_submenu = Gtk.Menu()
+        theme_item = Gtk.MenuItem(label=f"  🎨 Theme: {theme_info['name']}")
+        theme_item.set_submenu(theme_submenu)
+        
+        for theme_key in MascotTheme.get_all_themes():
+            theme_data = MascotTheme.get_theme(theme_key)
+            check = "✓ " if theme_key == self.mascot_theme else "  "
+            theme_opt = Gtk.MenuItem(label=f"{check}{theme_data['icon']} {theme_data['name']}")
+            theme_opt.connect("activate", lambda w, t=theme_key: self._menu_action(lambda: self.on_set_theme(t)))
+            theme_submenu.append(theme_opt)
+        
+        settings_menu.append(theme_item)
+        
+        # Mascot size submenu
+        size_item = Gtk.MenuItem(label=f"  📐 Size: {self.size_name.capitalize()}")
+        size_submenu = Gtk.Menu()
+        size_item.set_submenu(size_submenu)
+        
+        sizes = [('small', '🔹 Small'), ('medium', '🔸 Medium'), ('large', '🔶 Large')]
+        for size_key, size_label in sizes:
+            check = "✓ " if self.size_name == size_key else "   "
+            size_opt = Gtk.MenuItem(label=f"{check}{size_label}")
+            size_opt.connect("activate", lambda w, s=size_key: self._menu_action(lambda: self.on_set_size(s)))
+            size_submenu.append(size_opt)
+        
+        settings_menu.append(size_item)
+        
+        # EOD reminder time
+        eod_time = f"{self.eod_reminder_hour}:{self.eod_reminder_minute:02d}"
+        eod_item = Gtk.MenuItem(label=f"  🔔 End-of-day reminder: {eod_time}")
+        eod_item.connect("activate", lambda w: self._menu_action(self.on_set_eod_time))
+        settings_menu.append(eod_item)
+        
+        # Custom reminders submenu
+        reminders_count = len(self.scheduled_reminders)
+        reminders_item = Gtk.MenuItem(label=f"  ⏰ Custom reminders ({reminders_count})")
+        reminders_submenu = Gtk.Menu()
+        reminders_item.set_submenu(reminders_submenu)
+        
+        # Add new reminder
+        add_reminder = Gtk.MenuItem(label="➕ Add reminder...")
+        add_reminder.connect("activate", lambda w: self._menu_action(self.on_add_reminder))
+        reminders_submenu.append(add_reminder)
+        
+        if self.scheduled_reminders:
+            reminders_submenu.append(Gtk.SeparatorMenuItem())
+            for i, reminder in enumerate(self.scheduled_reminders):
+                r_time = reminder.get('time', '??:??')
+                r_msg = reminder.get('message', '')[:20]
+                if len(reminder.get('message', '')) > 20:
+                    r_msg += "..."
+                r_item = Gtk.MenuItem(label=f"  {r_time} - {r_msg}")
+                r_submenu = Gtk.Menu()
+                r_item.set_submenu(r_submenu)
+                
+                r_delete = Gtk.MenuItem(label="🗑️ Delete")
+                r_delete.connect("activate", lambda w, idx=i: self._menu_action(lambda: self.on_delete_reminder(idx)))
+                r_submenu.append(r_delete)
+                
+                reminders_submenu.append(r_item)
+        
+        settings_menu.append(reminders_item)
+        
+        settings_menu.append(Gtk.SeparatorMenuItem())
+        
+        # Auto-tracking settings
+        track_label = Gtk.MenuItem(label="  🤖 AUTO-TRACKING")
+        track_label.set_sensitive(False)
+        settings_menu.append(track_label)
+        
+        meeting_check = "✓" if self.auto_track_meetings else "○"
+        meeting_toggle = Gtk.MenuItem(label=f"    {meeting_check} Auto-track meetings")
+        meeting_toggle.connect("activate", lambda w: self._menu_action(self.on_toggle_auto_meetings))
+        settings_menu.append(meeting_toggle)
+        
+        # Info about which apps
+        if self.auto_track_meetings:
+            meeting_info = Gtk.MenuItem(label="      (Zoom, Meet, Teams)")
+            meeting_info.set_sensitive(False)
+            settings_menu.append(meeting_info)
+        
+        settings_menu.append(Gtk.SeparatorMenuItem())
+        
+        # Notification settings
+        notif_label = Gtk.MenuItem(label="  📱 NOTIFICATIONS")
+        notif_label.set_sensitive(False)
+        settings_menu.append(notif_label)
+        
+        notif_check = "✓" if self.show_system_notifications else "○"
+        notif_toggle = Gtk.MenuItem(label=f"    {notif_check} Show app notifications")
+        notif_toggle.connect("activate", lambda w: self._menu_action(self.on_toggle_notifications))
+        settings_menu.append(notif_toggle)
+        
+        if self.show_system_notifications:
+            all_check = "✓" if self.show_all_notifications else "○"
+            all_toggle = Gtk.MenuItem(label=f"    {all_check} Show ALL apps (noisy)")
+            all_toggle.connect("activate", lambda w: self._menu_action(self.on_toggle_all_notifications))
+            settings_menu.append(all_toggle)
+            
+            # Info about which apps
+            if not self.show_all_notifications:
+                apps_info = Gtk.MenuItem(label="      (Slack, Teams, Email, Git...)")
+                apps_info.set_sensitive(False)
+                settings_menu.append(apps_info)
+        
+        settings_menu.append(Gtk.SeparatorMenuItem())
+        
+        say_hi = Gtk.MenuItem(label="  💬 Say something!")
+        say_hi.connect("activate", lambda w: self._menu_action(self.on_say_something))
+        settings_menu.append(say_hi)
+        
+        menu.append(settings_item)
+        
+        menu.append(Gtk.SeparatorMenuItem())
+        
+        quit_item = Gtk.MenuItem(label="✕ Close Widget")
+        quit_item.connect("activate", lambda w: Gtk.main_quit())
+        menu.append(quit_item)
+        
+        menu.show_all()
+        return menu
+    
+    def on_draw(self, widget, cr):
+        width = widget.get_allocated_width()
+        height = widget.get_allocated_height()
+        center_x = width / 2
+        center_y = height / 2 + self.bubble_height / 2 - 5  # Offset for bubble
+        
+        # Clear background (transparent)
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        
+        # Draw speech bubble if there's a message
+        if self.speech_bubble.show_message and self.speech_bubble.current_message:
+            # Position bubble higher to prevent overlap with mascot
+            bubble_y = center_y - self.size/2 - 25
+            self._draw_speech_bubble(cr, center_x, bubble_y, 
+                                     self.speech_bubble.current_message)
+        
+        # Draw the mascot (new signature without tracking/paused params)
+        self.mascot.draw(cr, center_x, center_y, self.size * 0.9)
+        
+        # Draw timer badge when tracking
+        if self.is_tracking:
+            self._draw_timer_badge(cr, width, height)
+        elif self.today_hours > 0:
+            self._draw_hours_badge(cr, width, height)
+        
+        # Draw mascot name badge on hover
+        if self.hover:
+            self._draw_name_badge(cr, center_x, center_y + self.size/2 + 5)
+        
+        # Hover glow
+        if self.hover:
+            cr.set_source_rgba(1, 1, 1, 0.1)
+            cr.arc(center_x, center_y, self.size * 0.45, 0, 2 * math.pi)
+            cr.fill()
+        
+        return False
+    
+    def _draw_speech_bubble(self, cr, x, y, text):
+        """Draw a cute speech bubble above the mascot with auto-sizing"""
+        if not text:
+            return
+            
+        # Calculate text dimensions
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(10)
+        
+        # Determine max width based on text length (wider for longer messages)
+        text_len = len(text)
+        if text_len > 60:
+            max_width = 200
+        elif text_len > 40:
+            max_width = 170
+        else:
+            max_width = 140
+        
+        # Word wrap for long messages
+        words = text.split()
+        lines = []
+        current_line = ""
+        
+        for word in words:
+            test_line = current_line + " " + word if current_line else word
+            extents = cr.text_extents(test_line)
+            if extents.width <= max_width:
+                current_line = test_line
+            else:
+                if current_line:
+                    lines.append(current_line)
+                # Handle very long words (like URLs) - break them
+                if cr.text_extents(word).width > max_width:
+                    while word:
+                        for i in range(len(word), 0, -1):
+                            if cr.text_extents(word[:i]).width <= max_width:
+                                lines.append(word[:i])
+                                word = word[i:]
+                                break
+                        else:
+                            lines.append(word)
+                            word = ""
+                    current_line = ""
+                else:
+                    current_line = word
+        if current_line:
+            lines.append(current_line)
+        
+        if not lines:
+            return
+        
+        # Limit to 4 lines max, truncate if needed
+        if len(lines) > 4:
+            lines = lines[:4]
+            lines[-1] = lines[-1][:len(lines[-1])-3] + "..."
+            
+        # Calculate bubble dimensions
+        line_height = 14
+        padding = 8
+        max_line_width = max(cr.text_extents(line).width for line in lines)
+        bubble_width = max(max_line_width + padding * 2, 60)  # Minimum width
+        bubble_height = len(lines) * line_height + padding * 2
+        
+        bubble_x = x - bubble_width / 2
+        bubble_y = y - bubble_height - 10  # 10px for the pointer
+        
+        # Ensure bubble stays within reasonable bounds
+        bubble_x = max(5, min(bubble_x, self.get_allocated_width() - bubble_width - 5))
+        
+        # Draw bubble shadow
+        cr.set_source_rgba(0, 0, 0, 0.15)
+        self._draw_rounded_rect(cr, bubble_x + 2, bubble_y + 2, bubble_width, bubble_height, 12)
+        cr.fill()
+        
+        # Draw bubble background (gradient-like effect)
+        cr.set_source_rgba(1, 1, 1, 0.98)
+        self._draw_rounded_rect(cr, bubble_x, bubble_y, bubble_width, bubble_height, 12)
+        cr.fill()
+        
+        # Draw subtle border
+        cr.set_source_rgba(0.8, 0.8, 0.8, 0.6)
+        cr.set_line_width(1)
+        self._draw_rounded_rect(cr, bubble_x, bubble_y, bubble_width, bubble_height, 12)
+        cr.stroke()
+        
+        # Draw pointer (triangle pointing down) - position it centered on mascot
+        pointer_x = x
+        cr.set_source_rgba(1, 1, 1, 0.98)
+        cr.move_to(pointer_x - 8, bubble_y + bubble_height)
+        cr.line_to(pointer_x, bubble_y + bubble_height + 10)
+        cr.line_to(pointer_x + 8, bubble_y + bubble_height)
+        cr.close_path()
+        cr.fill()
+        
+        # Draw pointer border
+        cr.set_source_rgba(0.8, 0.8, 0.8, 0.6)
+        cr.move_to(pointer_x - 8, bubble_y + bubble_height)
+        cr.line_to(pointer_x, bubble_y + bubble_height + 10)
+        cr.line_to(pointer_x + 8, bubble_y + bubble_height)
+        cr.stroke()
+        
+        # Draw text (centered)
+        cr.set_source_rgba(0.15, 0.15, 0.15, 1)
+        for i, line in enumerate(lines):
+            extents = cr.text_extents(line)
+            text_x = bubble_x + (bubble_width - extents.width) / 2
+            text_y = bubble_y + padding + (i + 1) * line_height - 3
+            cr.move_to(text_x, text_y)
+            cr.show_text(line)
+    
+    def _draw_name_badge(self, cr, x, y):
+        """Draw mascot name badge on hover"""
+        text = self.mascot_name
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(9)
+        extents = cr.text_extents(text)
+        
+        # Background pill
+        cr.set_source_rgba(0.3, 0.3, 0.3, 0.8)
+        self._draw_rounded_rect(cr, x - extents.width/2 - 6, y - 6, extents.width + 12, 14, 7)
+        cr.fill()
+        
+        # Text
+        cr.set_source_rgb(1, 1, 1)
+        cr.move_to(x - extents.width/2, y + 3)
+        cr.show_text(text)
+    
+    def _draw_timer_badge(self, cr, width, height):
+        """Draw timer badge at bottom"""
+        badge_x = width / 2
+        badge_y = height - 12
+        
+        # Background pill
+        cr.set_source_rgba(0, 0, 0, 0.7)
+        self._draw_rounded_rect(cr, badge_x - 25, badge_y - 8, 50, 16, 8)
+        cr.fill()
+        
+        # Timer text
+        mins = self.elapsed_seconds // 60
+        secs = self.elapsed_seconds % 60
+        if mins >= 60:
+            hours = mins // 60
+            mins = mins % 60
+            text = f"{hours}:{mins:02d}"
+        else:
+            text = f"{mins}:{secs:02d}"
+        
+        cr.set_source_rgb(1, 1, 1)
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(10)
+        extents = cr.text_extents(text)
+        cr.move_to(badge_x - extents.width/2, badge_y + extents.height/3)
+        cr.show_text(text)
+        
+        # Pause indicator
+        if self.is_paused:
+            cr.set_source_rgba(1, 0.7, 0.3, 0.9)
+            cr.set_font_size(8)
+            cr.move_to(badge_x - 12, badge_y + 3)
+            cr.show_text("⏸")
+    
+    def _draw_hours_badge(self, cr, width, height):
+        """Draw today's hours badge"""
+        badge_x = width / 2
+        badge_y = height - 12
+        
+        hours = int(self.today_hours)
+        mins = int((self.today_hours - hours) * 60)
+        
+        if hours > 0:
+            text = f"{hours}h{mins:02d}"
+        else:
+            text = f"{mins}m"
+        
+        cr.set_source_rgba(0, 0, 0, 0.5)
+        self._draw_rounded_rect(cr, badge_x - 20, badge_y - 8, 40, 16, 8)
+        cr.fill()
+        
+        cr.set_source_rgba(1, 1, 1, 0.8)
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(10)
+        extents = cr.text_extents(text)
+        cr.move_to(badge_x - extents.width/2, badge_y + extents.height/3)
+        cr.show_text(text)
+    
+    def _menu_action(self, callback):
+        """Execute callback and ensure menu closes"""
+        if self.menu:
+            self.menu.popdown()
+            self.menu = None
+        # Use idle_add to execute after menu closes
+        GLib.idle_add(lambda: callback() if callable(callback) else None)
+    
+    def _draw_rounded_rect(self, cr, x, y, w, h, r):
+        cr.move_to(x + r, y)
+        cr.line_to(x + w - r, y)
+        cr.arc(x + w - r, y + r, r, -math.pi/2, 0)
+        cr.line_to(x + w, y + h - r)
+        cr.arc(x + w - r, y + h - r, r, 0, math.pi/2)
+        cr.line_to(x + r, y + h)
+        cr.arc(x + r, y + h - r, r, math.pi/2, math.pi)
+        cr.line_to(x, y + r)
+        cr.arc(x + r, y + r, r, math.pi, 3*math.pi/2)
+        cr.close_path()
+    
+    def update_animation(self):
+        self.mascot.next_frame()
+        
+        # Update speech bubble
+        self.speech_bubble.update(self.is_tracking, self.is_paused, self.today_hours)
+        
+        # Dynamic state management with all Iron Man states
+        if not hasattr(self, 'state_counter'):
+            self.state_counter = 0
+            self.state_duration = 0
+            self.current_state_time = 0
+        
+        self.state_counter += 1
+        self.current_state_time += 1
+        
+        # Change states dynamically every 3-6 seconds
+        if self.current_state_time >= self.state_duration:
+            self.current_state_time = 0
+            self.state_duration = random.randint(60, 120)  # 3-6 seconds at 20 FPS
+            self.mascot.state_frame = 0  # Reset state frame counter
+            
+            if self.is_tracking:
+                # While working, show all combat/action states
+                states = [
+                    MascotCharacter.IDLE,
+                    MascotCharacter.WORKING,
+                    MascotCharacter.THINKING,
+                    MascotCharacter.CELEBRATING
+                ]
+                self.mascot.state = random.choice(states)
+            else:
+                # When not tracking, show variety of moves
+                states = [
+                    MascotCharacter.IDLE,
+                    MascotCharacter.SLEEPING,
+                    MascotCharacter.WAVING,
+                    MascotCharacter.JUMPING
+                ]
+                self.mascot.state = random.choice(states)
+        
+        self.queue_draw()
+        return True
+    
+    def update_timer(self):
+        if self.is_tracking and not self.is_paused and self.task_start_time:
+            self.elapsed_seconds = int(time.time() - self.task_start_time)
+        return True
+    
+    def check_idle(self):
+        try:
+            result = subprocess.run(['xprintidle'], capture_output=True, text=True, timeout=2)
+            idle_ms = int(result.stdout.strip())
+            idle_seconds = idle_ms / 1000
+            
+            if idle_seconds > self.idle_threshold:
+                if self.is_tracking and not self.is_paused and not self.was_idle:
+                    self.was_idle = True
+                    self.notify("Idle detected", f"You've been away for {int(idle_seconds/60)} min. Task paused.")
+                    self.auto_pause()
+            else:
+                if self.was_idle:
+                    self.was_idle = False
+                    if self.paused_tasks:
+                        self.notify("Welcome back!", "Click to resume your task.")
+        except:
+            pass
+        return True
+    
+    def check_break_reminder(self):
+        if self.is_tracking and not self.is_paused and self.continuous_work_start:
+            continuous_seconds = time.time() - self.continuous_work_start
+            
+            if continuous_seconds >= self.break_reminder_threshold:
+                if time.time() - self.last_break_reminder > 1800:
+                    self.last_break_reminder = time.time()
+                    hours = int(continuous_seconds / 3600)
+                    mins = int((continuous_seconds % 3600) / 60)
+                    self.notify("☕ Time for a break!", 
+                               f"You've been working for {hours}h {mins}m.\nConsider taking a short break.")
+        return True
+    
+    def check_git_activity(self):
+        """Check for recent git commands and celebrate"""
+        try:
+            activity = self.git_monitor.check_recent_git_activity()
+            if activity:
+                activity_type, message = activity
+                self.speech_bubble.set_message(message)
+                self.mascot.state = MascotCharacter.CELEBRATING
+                self.mascot.state_timer = 0
+                
+                # Wake up if sleepy
+                if self.is_sleepy:
+                    self.is_sleepy = False
+                    self.mascot.set_sleepy(False)
+                    self.idle_start_time = time.time()
+        except:
+            pass
+        return True
+    
+    def check_eod_reminder(self):
+        """Check if it's time for end-of-day standup reminder"""
+        try:
+            now = time.localtime()
+            today = (now.tm_year, now.tm_mon, now.tm_mday)
+            
+            # Reset reminder flag for new day
+            if self.last_eod_check_date != today:
+                self.last_eod_check_date = today
+                self.eod_reminded_today = False
+                self.triggered_reminders_today = set()  # Reset custom reminders too
+            
+            # Check if it's reminder time
+            if not self.eod_reminded_today:
+                if now.tm_hour == self.eod_reminder_hour and now.tm_min >= self.eod_reminder_minute:
+                    self.eod_reminded_today = True
+                    
+                    # Show message and notification
+                    eod_msg = self.speech_bubble.force_message("eod")
+                    self.speech_bubble.set_message(eod_msg)
+                    
+                    self.notify("📋 End of Day Reminder", 
+                               f"Hey {self.user_name}! Time to export your standup report.\n"
+                               "Click me → Standup Report to copy your logs!")
+                    
+                    # Wake up if sleepy
+                    if self.is_sleepy:
+                        self.is_sleepy = False
+                        self.mascot.set_sleepy(False)
+                    
+                    self.mascot.state = MascotCharacter.WAVING
+                    self.mascot.state_timer = 0
+            
+            # Check custom scheduled reminders
+            self._check_scheduled_reminders(now)
+        except:
+            pass
+        return True
+    
+    def _check_scheduled_reminders(self, now):
+        """Check custom scheduled reminders"""
+        try:
+            current_time = f"{now.tm_hour:02d}:{now.tm_min:02d}"
+            
+            for reminder in self.scheduled_reminders:
+                reminder_time = reminder.get('time', '')
+                reminder_msg = reminder.get('message', '')
+                reminder_key = f"{reminder_time}:{reminder_msg}"
+                
+                if reminder_time == current_time and reminder_key not in self.triggered_reminders_today:
+                    self.triggered_reminders_today.add(reminder_key)
+                    
+                    # Show the message
+                    self.speech_bubble.set_message(f"⏰ {reminder_msg}")
+                    self.notify(f"⏰ Reminder", reminder_msg)
+                    
+                    # Wake up if sleepy
+                    if self.is_sleepy:
+                        self.is_sleepy = False
+                        self.mascot.set_sleepy(False)
+                    
+                    self.mascot.state = MascotCharacter.WAVING
+                    self.mascot.state_timer = 0
+        except:
+            pass
+        return True
+    
+    def check_meeting_call(self):
+        """Detect active meeting calls (Zoom, Google Meet, Teams) and auto-track"""
+        if not self.auto_track_meetings:
+            return True
+        
+        try:
+            # Get all window titles
+            result = subprocess.run(
+                ['wmctrl', '-l'],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            
+            if result.returncode != 0:
+                return True
+            
+            windows = result.stdout.lower()
+            current_in_meeting = False
+            detected_app = None
+            
+            # Check for Zoom meeting
+            if 'zoom meeting' in windows or 'zoom workplace' in windows:
+                current_in_meeting = True
+                detected_app = 'Zoom'
+            
+            # Check for Google Meet
+            elif 'meet.google.com' in windows or '- google meet' in windows:
+                current_in_meeting = True
+                detected_app = 'Google Meet'
+            
+            # Check for Microsoft Teams
+            elif 'microsoft teams' in windows and ('| call' in windows or '| meeting' in windows):
+                current_in_meeting = True
+                detected_app = 'Teams'
+            
+            # State change: Meeting started
+            if current_in_meeting and not self.in_meeting:
+                self.in_meeting = True
+                self.meeting_app = detected_app
+                self.meeting_task_name = f"Meeting - {detected_app}"
+                
+                # Auto-start tracking if not already tracking
+                if not self.is_tracking:
+                    self.on_quick_start(None, self.meeting_task_name)
+                    self.speech_bubble.set_message(f"📞 Joined {detected_app} meeting!")
+                    self.notify("Meeting Detected", f"Auto-tracking: {self.meeting_task_name}")
+                else:
+                    # Just notify, don't interrupt current task
+                    self.speech_bubble.set_message(f"📞 {detected_app} call detected")
+            
+            # State change: Meeting ended
+            elif not current_in_meeting and self.in_meeting:
+                self.in_meeting = False
+                ended_app = self.meeting_app
+                self.meeting_app = None
+                
+                # Stop tracking if we auto-started it
+                if self.is_tracking and self.current_task == self.meeting_task_name:
+                    self.on_stop()
+                    self.speech_bubble.set_message(f"📞 Meeting ended! ({ended_app})")
+                    self.notify("Meeting Ended", f"Logged: {self.meeting_task_name}")
+                
+                self.meeting_task_name = None
+            
+        except subprocess.TimeoutExpired:
+            pass
+        except FileNotFoundError:
+            # wmctrl not installed, disable feature
+            self.auto_track_meetings = False
+        except:
+            pass
+        
+        return True
+    
+    def check_sleepy_mode(self):
+        """Check if mascot should enter sleepy mode"""
+        try:
+            # Check system idle time
+            result = subprocess.run(['xprintidle'], capture_output=True, text=True, timeout=2)
+            idle_ms = int(result.stdout.strip())
+            idle_seconds = idle_ms / 1000
+            
+            # If idle for too long and not tracking, enter sleepy mode
+            if idle_seconds > self.sleepy_threshold and not self.is_tracking:
+                if not self.is_sleepy:
+                    self.is_sleepy = True
+                    self.mascot.set_sleepy(True)
+                    sleepy_msg = self.speech_bubble.force_message("sleepy")
+                    self.speech_bubble.set_message(sleepy_msg)
+            else:
+                # Wake up
+                if self.is_sleepy:
+                    self.is_sleepy = False
+                    self.mascot.set_sleepy(False)
+                    self.idle_start_time = time.time()
+        except:
+            pass
+        return True
+    
+    def auto_pause(self):
+        if self.is_tracking and not self.is_paused:
+            self.is_paused = True
+            self.paused_tasks.insert(0, {
+                'task': self.current_task,
+                'elapsed': self.elapsed_seconds,
+                'paused_at': time.time()
+            })
+            self.save_history()
+            self.run_cmd("workpulse stop")
+            self.mascot.change_random_state(True, True)
+    
+    def on_enter(self, widget, event):
+        self.hover = True
+    
+    def on_leave(self, widget, event):
+        self.hover = False
+    
+    def _on_menu_deactivate(self, menu):
+        """Called when menu is closed/deactivated"""
+        self.menu = None
+    
+    def on_button_press(self, widget, event):
+        if event.button == 1:
+            # Left click - start drag using Wayland-compatible method
+            # For undecorated windows, use begin_move_drag which works on Wayland
+            window = self.get_window()
+            if window:
+                window.begin_move_drag(
+                    event.button,
+                    int(event.x_root),
+                    int(event.y_root),
+                    event.time
+                )
+        elif event.button == 3:
+            # Right click - show menu
+            if self.menu:
+                self.menu.popdown()
+            self.menu = self.create_menu()
+            # Use popup_at_pointer for Wayland compatibility
+            self.menu.popup_at_pointer(event)
+    
+    def on_button_release(self, widget, event):
+        # No need to handle release for begin_move_drag
+        pass
+    
+    def on_motion(self, widget, event):
+        # Motion is handled by begin_move_drag automatically
+        pass
+    
+    def clean_task_name(self, task):
+        if not task:
+            return ""
+        task = re.sub(r'\+\w+', '', task)
+        task = task.replace('"', '').replace("'", "")
+        return task.strip()
+    
+    def run_cmd(self, cmd):
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+            return result.stdout.strip()
+        except:
+            return ""
+    
+    def update_status(self):
+        try:
+            status = self.run_cmd("timeout 3 workpulse status 2>/dev/null")
+            
+            task = ""
+            for line in status.split('\n'):
+                if "Current Task:" in line:
+                    task = line.split("Current Task:")[-1].strip()
+                    break
+            
+            task = self.clean_task_name(task)
+            was_tracking = self.is_tracking
+            self.is_tracking = task and task != "None"
+            
+            if self.is_tracking and not was_tracking:
+                self.current_task = task
+                self.task_start_time = time.time()
+                self.elapsed_seconds = 0
+                self.is_paused = False
+                self.continuous_work_start = time.time()
+                self.add_to_history(task)
+                self.mascot.change_random_state(True, False)
+            elif not self.is_tracking:
+                self.current_task = ""
+                self.task_start_time = None
+                self.elapsed_seconds = 0
+                self.continuous_work_start = None
+                self.mascot.change_random_state(False, False)
+            
+            for line in status.split('\n'):
+                if "Today's Total:" in line:
+                    time_str = line.split("Today's Total:")[-1].strip()
+                    try:
+                        self.today_hours = float(time_str.split()[0])
+                    except:
+                        self.today_hours = 0
+                    break
+        except:
+            pass
+        
+        return True
+    
+    def notify(self, title, msg):
+        # Use mascot name in title for personal touch
+        display_title = title.replace("WorkPulse", self.mascot_name)
+        subprocess.Popen(['notify-send', '-i', 'appointment-soon', display_title, msg],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    def on_quick_start(self, widget, task):
+        if self.is_tracking and self.current_task:
+            self.paused_tasks.insert(0, {
+                'task': self.current_task,
+                'elapsed': self.elapsed_seconds,
+                'paused_at': time.time()
+            })
+            self.save_history()
+        
+        self.run_cmd(f'workpulse start "{task}"')
+        self.current_task = task
+        self.task_start_time = time.time()
+        self.elapsed_seconds = 0
+        self.is_tracking = True
+        self.is_paused = False
+        self.continuous_work_start = time.time()
+        self.add_to_history(task)
+        self.mascot.change_random_state(True, False)
+        
+        # Personal touch messages
+        start_messages = [
+            f"Let's go, {self.user_name}! 🚀",
+            f"Starting: {task[:15]}...",
+            "Focus time! 🎯",
+            f"You got this! 💪",
+            "Let's crush it!",
+        ]
+        self.speech_bubble.set_message(random.choice(start_messages))
+        self.notify("WorkPulse", f"Started: {task}")
+    
+    def on_custom_task(self, widget=None):
+        try:
+            result = subprocess.run(
+                ['zenity', '--entry', '--title=WorkPulse', '--text=What are you working on?', '--width=350'],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                task = result.stdout.strip()
+                self.on_quick_start(None, task)
+        except:
+            pass
+    
+    def on_pause(self, widget=None):
+        if self.is_tracking:
+            if self.is_paused:
+                self.is_paused = False
+                self.task_start_time = time.time() - self.elapsed_seconds
+                self.run_cmd(f'workpulse start "{self.current_task}"')
+                self.mascot.change_random_state(True, False)
+                self.notify("WorkPulse", f"Resumed: {self.current_task}")
+            else:
+                self.is_paused = True
+                self.paused_tasks.insert(0, {
+                    'task': self.current_task,
+                    'elapsed': self.elapsed_seconds,
+                    'paused_at': time.time()
+                })
+                self.save_history()
+                self.run_cmd("workpulse stop")
+                self.mascot.change_random_state(True, True)
+                self.notify("WorkPulse", f"Paused: {self.current_task}")
+    
+    def on_resume_paused(self, widget, task_info):
+        task = task_info.get('task', '')
+        elapsed = task_info.get('elapsed', 0)
+        
+        self.paused_tasks = [t for t in self.paused_tasks if t.get('task') != task]
+        self.save_history()
+        
+        if self.is_tracking and self.current_task:
+            self.paused_tasks.insert(0, {
+                'task': self.current_task,
+                'elapsed': self.elapsed_seconds,
+                'paused_at': time.time()
+            })
+            self.save_history()
+        
+        self.run_cmd(f'workpulse start "{task}"')
+        self.current_task = task
+        self.elapsed_seconds = elapsed
+        self.task_start_time = time.time() - elapsed
+        self.is_tracking = True
+        self.is_paused = False
+        self.continuous_work_start = time.time()
+        self.mascot.change_random_state(True, False)
+        self.notify("WorkPulse", f"Resumed: {task}")
+    
+    def on_stop(self, widget=None):
+        self.run_cmd("workpulse stop")
+        if self.current_task:
+            self.add_to_history(self.current_task)
+        self.is_tracking = False
+        self.is_paused = False
+        self.current_task = ""
+        self.task_start_time = None
+        self.elapsed_seconds = 0
+        self.continuous_work_start = None
+        self.mascot.change_random_state(False, False)
+        
+        # Encouraging stop messages
+        stop_messages = [
+            f"Great work, {self.user_name}! ✨",
+            "Task complete! 🎉",
+            "Nice job! 👏",
+            "Well done! ⭐",
+        ]
+        self.speech_bubble.set_message(random.choice(stop_messages))
+        self.notify("WorkPulse", "Tracking stopped")
+        GLib.timeout_add(500, self.update_status)
+    
+    def on_report(self, widget=None):
+        self.run_cmd("workpulse export standup")
+        report_file = subprocess.run(
+            "ls -t ~/.local/share/workpulse/exports/*standup*.md 2>/dev/null | head -1",
+            shell=True, capture_output=True, text=True
+        ).stdout.strip()
+        if report_file:
+            subprocess.Popen(['xdg-open', report_file], 
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    def on_status(self, widget=None):
+        status = self.run_cmd("timeout 3 workpulse status 2>/dev/null")
+        subprocess.Popen(['zenity', '--info', '--title=WorkPulse Status', '--text=' + status, '--width=400'],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    def on_set_mascot_name(self, widget=None):
+        """Let user set the mascot's nickname"""
+        try:
+            result = subprocess.run(
+                ['zenity', '--entry', 
+                 f'--title=Name Your Mascot',
+                 f'--text=What would you like to call me?\n(Current: {self.mascot_name})',
+                 f'--entry-text={self.mascot_name}',
+                 '--width=300'],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                self.mascot_name = result.stdout.strip()[:20]  # Max 20 chars
+                self.save_settings()
+                self.speech_bubble.set_message(f"I'm {self.mascot_name} now! 🎉")
+                self.notify("WorkPulse", f"Mascot renamed to {self.mascot_name}")
+        except:
+            pass
+    
+    def on_set_user_name(self, widget=None):
+        """Let user set what the mascot calls them"""
+        try:
+            result = subprocess.run(
+                ['zenity', '--entry',
+                 f'--title=Your Name',
+                 f'--text=What should {self.mascot_name} call you?\n(Current: {self.user_name})',
+                 f'--entry-text={self.user_name}',
+                 '--width=300'],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                self.user_name = result.stdout.strip()[:20]  # Max 20 chars
+                self.save_settings()
+                self.speech_bubble.set_user_name(self.user_name)
+                self.speech_bubble.set_message(f"Nice to meet you, {self.user_name}! 👋")
+                self.notify("WorkPulse", f"I'll call you {self.user_name} now!")
+        except:
+            pass
+    
+    def on_say_something(self, widget=None):
+        """Make the mascot say a random motivational message"""
+        if self.is_tracking:
+            msg = self.speech_bubble.force_message("working")
+        else:
+            msg = self.speech_bubble.force_message("greeting")
+        self.speech_bubble.set_message(msg)
+    
+    def on_set_theme(self, theme):
+        """Set the mascot theme"""
+        self.mascot_theme = theme
+        self.mascot.set_theme(theme)
+        self.save_settings()
+        theme_info = MascotTheme.get_theme(theme)
+        self.speech_bubble.set_message(f"I'm a {theme_info['name'].split()[0]} now! {theme_info['icon']}")
+        self.notify("WorkPulse", f"Theme changed to {theme_info['name']}")
+    
+    def on_set_eod_time(self, widget=None):
+        """Set end-of-day reminder time"""
+        try:
+            current_time = f"{self.eod_reminder_hour}:{self.eod_reminder_minute:02d}"
+            result = subprocess.run(
+                ['zenity', '--entry',
+                 '--title=End-of-Day Reminder',
+                 f'--text=When should I remind you to export standup?\nFormat: HH:MM (24-hour)\n(Current: {current_time})',
+                 f'--entry-text={current_time}',
+                 '--width=300'],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                time_str = result.stdout.strip()
+                parts = time_str.split(':')
+                if len(parts) == 2:
+                    hour = int(parts[0])
+                    minute = int(parts[1])
+                    if 0 <= hour <= 23 and 0 <= minute <= 59:
+                        self.eod_reminder_hour = hour
+                        self.eod_reminder_minute = minute
+                        self.eod_reminded_today = False  # Reset reminder
+                        self.save_settings()
+                        self.speech_bubble.set_message(f"I'll remind you at {hour}:{minute:02d}! ⏰")
+                        self.notify("WorkPulse", f"End-of-day reminder set for {hour}:{minute:02d}")
+                    else:
+                        self.notify("WorkPulse", "Invalid time. Use HH:MM format (00:00 - 23:59)")
+        except:
+            pass
+    
+    def on_toggle_notifications(self, widget=None):
+        """Toggle system notifications display"""
+        self.show_system_notifications = not self.show_system_notifications
+        self.save_settings()
+        
+        # Update notification listener
+        if hasattr(self, 'notification_listener') and self.notification_listener:
+            self.notification_listener.set_enabled(self.show_system_notifications)
+        
+        if self.show_system_notifications:
+            self.speech_bubble.set_message("I'll show you notifications! 📬")
+        else:
+            self.speech_bubble.set_message("No more notification popups! 🔕")
+    
+    def on_toggle_auto_meetings(self, widget=None):
+        """Toggle automatic meeting call tracking"""
+        self.auto_track_meetings = not self.auto_track_meetings
+        self.save_settings()
+        
+        if self.auto_track_meetings:
+            self.speech_bubble.set_message("I'll auto-track your meetings! 📞")
+            self.notify("Auto-Track Meetings", "Enabled: Zoom, Google Meet, Teams")
+        else:
+            self.speech_bubble.set_message("Meeting auto-track disabled 🔕")
+            self.notify("Auto-Track Meetings", "Disabled")
+    
+    def on_toggle_all_notifications(self, widget=None):
+        """Toggle showing all notifications vs priority apps only"""
+        self.show_all_notifications = not self.show_all_notifications
+        self.save_settings()
+        
+        # Update notification listener
+        if hasattr(self, 'notification_listener') and self.notification_listener:
+            self.notification_listener.set_show_all(self.show_all_notifications)
+        
+        if self.show_all_notifications:
+            self.speech_bubble.set_message("Showing ALL app notifications! 📢")
+        else:
+            self.speech_bubble.set_message("Priority apps only (Slack, Teams...) 📩")
+    
+    def on_set_size(self, size_name):
+        """Change mascot size"""
+        self.size_name = size_name
+        self._apply_size()
+        self.save_settings()
+        
+        # Resize window
+        self.set_size_request(self.size + 80, self.size + self.bubble_height + 30)
+        self.queue_draw()
+        
+        size_labels = {'small': 'Compact mode! 🔹', 'medium': 'Normal size! 🔸', 'large': 'Big and visible! 🔶'}
+        self.speech_bubble.set_message(size_labels.get(size_name, 'Size updated!'))
+    
+    def on_add_reminder(self, widget=None):
+        """Add a custom scheduled reminder"""
+        try:
+            # Ask for time
+            result = subprocess.run(
+                ['zenity', '--entry',
+                 '--title=Add Reminder',
+                 '--text=What time should I remind you?\nFormat: HH:MM (24-hour)',
+                 '--entry-text=09:00',
+                 '--width=300'],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return
+            
+            time_str = result.stdout.strip()
+            # Validate time format
+            parts = time_str.split(':')
+            if len(parts) != 2:
+                self.notify("WorkPulse", "Invalid time format. Use HH:MM")
+                return
+            
+            try:
+                hour = int(parts[0])
+                minute = int(parts[1])
+                if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                    raise ValueError()
+                time_str = f"{hour:02d}:{minute:02d}"
+            except:
+                self.notify("WorkPulse", "Invalid time. Use HH:MM (00:00 - 23:59)")
+                return
+            
+            # Ask for message
+            result = subprocess.run(
+                ['zenity', '--entry',
+                 '--title=Add Reminder',
+                 f'--text=What should I remind you at {time_str}?',
+                 '--entry-text=Take a break!',
+                 '--width=400'],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return
+            
+            message = result.stdout.strip()
+            
+            # Add to reminders
+            self.scheduled_reminders.append({
+                'time': time_str,
+                'message': message
+            })
+            self.save_settings()
+            
+            self.speech_bubble.set_message(f"Reminder set for {time_str}! ⏰")
+            self.notify("WorkPulse", f"Reminder added for {time_str}: {message}")
+            
+        except Exception as e:
+            pass
+    
+    def on_delete_reminder(self, index):
+        """Delete a scheduled reminder"""
+        try:
+            if 0 <= index < len(self.scheduled_reminders):
+                removed = self.scheduled_reminders.pop(index)
+                self.save_settings()
+                self.speech_bubble.set_message("Reminder removed! 🗑️")
+        except:
+            pass
+    
+    def on_copy_report(self, widget=None):
+        """Generate and copy standup report to clipboard"""
+        try:
+            # Generate report
+            self.run_cmd("workpulse export standup")
+            
+            # Find the latest report file
+            report_file = subprocess.run(
+                "ls -t ~/.local/share/workpulse/exports/*standup*.md 2>/dev/null | head -1",
+                shell=True, capture_output=True, text=True
+            ).stdout.strip()
+            
+            if report_file and os.path.exists(report_file):
+                # Read report content
+                with open(report_file, 'r') as f:
+                    content = f.read()
+                
+                # Copy to clipboard using xclip or xsel
+                try:
+                    # Try xclip first
+                    process = subprocess.Popen(['xclip', '-selection', 'clipboard'],
+                                             stdin=subprocess.PIPE)
+                    process.communicate(content.encode())
+                    copied = process.returncode == 0
+                except:
+                    try:
+                        # Fall back to xsel
+                        process = subprocess.Popen(['xsel', '--clipboard', '--input'],
+                                                 stdin=subprocess.PIPE)
+                        process.communicate(content.encode())
+                        copied = process.returncode == 0
+                    except:
+                        copied = False
+                
+                if copied:
+                    self.speech_bubble.set_message("Copied! 📋✅")
+                    self.notify("WorkPulse", "Standup report copied to clipboard!\nPaste it into ClickUp/Jira.")
+                else:
+                    # Fallback: show in zenity for manual copy
+                    subprocess.Popen(['zenity', '--text-info', '--title=Standup Report (Copy from here)', 
+                                    '--filename=' + report_file, '--width=500', '--height=400'],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    self.speech_bubble.set_message("Copy from dialog 📋")
+            else:
+                self.notify("WorkPulse", "No report found. Make sure you have tracked time today.")
+        except Exception as e:
+            self.notify("WorkPulse", f"Error: {str(e)}")
+
+def main():
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    try:
+        mascot = WorkPulseMascot()
+        Gtk.main()
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+    return 0
+
+if __name__ == "__main__":
+    exit(main())

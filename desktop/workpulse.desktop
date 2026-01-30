@@ -1,0 +1,30 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=WorkPulse
+GenericName=Time Tracker
+Comment=Cute animated time tracking mascot for developers
+Exec=workpulse-mascot
+Icon=workpulse
+Terminal=false
+Categories=Office;Utility;ProjectManagement;GTK;
+Keywords=time;tracking;productivity;timewarrior;mascot;standup;
+StartupNotify=false
+StartupWMClass=workpulse-mascot
+Actions=status;start;stop;report;
+
+[Desktop Action status]
+Name=Show Status
+Exec=workpulse status
+
+[Desktop Action start]
+Name=Start Tracking
+Exec=workpulse start
+
+[Desktop Action stop]
+Name=Stop Tracking
+Exec=workpulse stop
+
+[Desktop Action report]
+Name=Today's Report
+Exec=workpulse export standup

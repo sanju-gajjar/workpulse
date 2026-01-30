@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=WorkPulse Tray
+Comment=WorkPulse system tray indicator
+Exec=workpulse-tray
+Icon=appointment-soon
+Terminal=false
+Categories=Utility;
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=3

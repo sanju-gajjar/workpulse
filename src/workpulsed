@@ -1,0 +1,613 @@
+#!/usr/bin/env bash
+# ============================================================================
+# WORKPULSE DAEMON (workpulsed)
+# ============================================================================
+# Main background service that orchestrates all WorkPulse functionality
+# Manages prompts, time tracking, and force mode activation
+# ============================================================================
+
+set -euo pipefail
+
+# Determine installation directory
+if [[ -L "${BASH_SOURCE[0]}" ]]; then
+    INSTALL_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+else
+    INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+
+# Source libraries
+LIB_DIR="$INSTALL_DIR/lib"
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/state.sh"
+source "$LIB_DIR/tracker.sh"
+source "$LIB_DIR/prompt.sh"
+source "$LIB_DIR/forcelock.sh"
+source "$LIB_DIR/reporter.sh"
+
+# ============================================================================
+# DAEMON CONFIGURATION
+# ============================================================================
+
+readonly DAEMON_NAME="workpulsed"
+readonly DAEMON_VERSION="$WORKPULSE_VERSION"
+
+# Loop interval in seconds (check every minute)
+readonly LOOP_INTERVAL=60
+
+# Flag to control main loop
+RUNNING=true
+
+# ============================================================================
+# SIGNAL HANDLERS
+# ============================================================================
+
+handle_sigterm() {
+    log_info "Received SIGTERM, shutting down gracefully..."
+    RUNNING=false
+}
+
+handle_sighup() {
+    log_info "Received SIGHUP, reloading configuration..."
+    reload_config
+}
+
+handle_sigusr1() {
+    log_info "Received SIGUSR1, triggering immediate prompt..."
+    do_prompt
+}
+
+handle_sigusr2() {
+    log_info "Received SIGUSR2, showing status..."
+    show_status
+}
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+reload_config() {
+    if [[ -f "$DEFAULT_CONFIG_FILE" ]]; then
+        log_info "Reloading configuration from $DEFAULT_CONFIG_FILE"
+        # shellcheck disable=SC1090
+        source "$DEFAULT_CONFIG_FILE"
+    fi
+}
+
+# ============================================================================
+# IPC SOCKET SERVER
+# ============================================================================
+
+# Start IPC socket listener
+start_ipc_server() {
+    local socket="${IPC_SOCKET:-$DEFAULT_IPC_SOCKET}"
+    local cmd_file="${socket}.cmd"
+    local resp_file="${socket}.resp"
+    
+    # Remove old files if exists
+    rm -f "$socket" "$cmd_file" "$resp_file"
+    
+    # Create marker file to indicate daemon is ready
+    touch "$socket"
+    
+    log_info "Starting IPC server (file-based) at $socket"
+    
+    # Run IPC handler in background - poll for command file
+    (
+        while [[ -e "$socket" ]]; do
+            if [[ -f "$cmd_file" ]]; then
+                local cmd
+                cmd=$(cat "$cmd_file" 2>/dev/null)
+                rm -f "$cmd_file"
+                
+                if [[ -n "$cmd" ]]; then
+                    log_debug "IPC received: $cmd"
+                    handle_ipc_command "$cmd" > "$resp_file" 2>&1
+                fi
+            fi
+            sleep 0.2
+        done
+    ) &
+    
+    IPC_PID=$!
+    log_debug "IPC server PID: $IPC_PID"
+}
+
+# Handle IPC commands
+handle_ipc_command() {
+    local cmd="$1"
+    log_debug "IPC command: $cmd"
+    
+    case "$cmd" in
+        status)
+            show_status
+            ;;
+        prompt)
+            do_prompt
+            ;;
+        focus)
+            start_focus_mode_interactive
+            ;;
+        unfocus)
+            stop_focus_mode_interactive
+            ;;
+        stop)
+            RUNNING=false
+            echo "Stopping daemon..."
+            ;;
+        reload)
+            reload_config
+            echo "Configuration reloaded"
+            ;;
+        summary)
+            show_daily_summary
+            ;;
+        export)
+            export_all
+            ;;
+        force-unlock)
+            emergency_unlock
+            echo "Emergency unlock triggered"
+            ;;
+        *)
+            echo "Unknown command: $cmd"
+            ;;
+    esac
+}
+
+# Stop IPC server
+stop_ipc_server() {
+    local socket="${IPC_SOCKET:-$DEFAULT_IPC_SOCKET}"
+    rm -f "$socket" "${socket}.cmd" "${socket}.resp"
+    
+    if [[ -n "${IPC_PID:-}" ]]; then
+        kill "$IPC_PID" 2>/dev/null || true
+    fi
+}
+
+# ============================================================================
+# MAIN LOOP LOGIC
+# ============================================================================
+
+# Check if we should start working hours
+check_work_start() {
+    local session_start
+    session_start=$(get_state "session_start")
+    
+    # If no session today, initialize
+    if [[ -z "$session_start" ]] || [[ "$session_start" == "null" ]]; then
+        if is_within_working_hours; then
+            log_info "Starting new work session"
+            reset_daily_state
+            
+            send_notification \
+                "🌅 WorkPulse Active" \
+                "Good morning! Time tracking is now active.\nWorking hours: ${WORK_START} - ${WORK_END}" \
+                "low" \
+                "5000" \
+                "appointment-soon"
+            
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+# Check if we should end working hours
+check_work_end() {
+    local summary_time="${SUMMARY_TIME:-19:30}"
+    local now=$(date '+%H:%M')
+    
+    # Check if it's time for end-of-day summary
+    if [[ "$now" == "$summary_time" ]]; then
+        local last_summary
+        last_summary=$(get_state "last_summary_date")
+        local today=$(date '+%Y-%m-%d')
+        
+        if [[ "$last_summary" != "$today" ]]; then
+            log_info "Running end-of-day summary"
+            set_state "last_summary_date" "$today"
+            run_end_of_day
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+# Check if prompt is due
+check_prompt_due() {
+    # Skip if in focus mode
+    if is_focus_mode; then
+        log_debug "Focus mode active, skipping prompt check"
+        return 1
+    fi
+    
+    # Skip if outside working hours
+    if ! is_within_working_hours; then
+        log_debug "Outside working hours, skipping prompt"
+        return 1
+    fi
+    
+    # Get next prompt timestamp
+    local next_prompt
+    next_prompt=$(get_state "next_prompt_timestamp")
+    
+    # If not set, initialize with current time + default interval (60 minutes)
+    if [[ -z "$next_prompt" ]]; then
+        local current_time
+        current_time=$(date +%s)
+        local freq
+        freq=$(get_state "prompt_frequency_minutes")
+        freq=${freq:-60}
+        next_prompt=$((current_time + freq * 60))
+        set_state "next_prompt_timestamp" "$next_prompt"
+        return 1
+    fi
+    
+    # Check if current time >= next prompt time
+    local current_time
+    current_time=$(date +%s)
+    
+    if (( current_time >= next_prompt )); then
+        return 0
+    fi
+    
+    return 1
+}
+
+# Check if force mode should trigger
+check_force_mode() {
+    if should_trigger_force_mode; then
+        log_warn "Force mode conditions met!"
+        
+        # Send warning first
+        send_force_warning
+        sleep 5
+        
+        # Check again in case user responded to warning
+        if should_trigger_force_mode; then
+            log_warn "Activating force mode"
+            activate_force_mode_auto
+        fi
+    fi
+}
+
+# Update work hour tracking
+update_work_hours() {
+    if is_within_working_hours && ! is_focus_mode; then
+        # Increment work hours counter (in 1-minute increments)
+        local current_hours
+        current_hours=$(get_state "consecutive_work_hours")
+        current_hours=${current_hours:-0}
+        
+        # Convert to minutes for more accurate tracking
+        local work_minutes
+        work_minutes=$(get_state "consecutive_work_minutes")
+        work_minutes=${work_minutes:-0}
+        
+        work_minutes=$((work_minutes + 1))
+        set_state "consecutive_work_minutes" "$work_minutes"
+        
+        # Update hours (floor division)
+        local new_hours=$((work_minutes / 60))
+        if [[ "$new_hours" != "$current_hours" ]]; then
+            set_state "consecutive_work_hours" "$new_hours"
+            log_debug "Work hours updated: $new_hours"
+        fi
+    fi
+}
+
+# Check if current task has been running for more than 1 hour
+check_long_running_task() {
+    # Skip if no current task
+    local current_task
+    current_task=$(get_current_task)
+    if [[ -z "$current_task" ]]; then
+        return 1
+    fi
+    
+    # Skip if in focus mode
+    if is_focus_mode; then
+        return 1
+    fi
+    
+    # Get task duration in minutes
+    local duration
+    duration=$(get_current_elapsed)
+    if [[ -z "$duration" ]] || (( duration < 60 )); then
+        return 1
+    fi
+    
+    # Check if we already prompted for this task
+    local last_long_prompt
+    last_long_prompt=$(get_state "last_long_running_prompt")
+    
+    if [[ "$last_long_prompt" == "$current_task" ]]; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# Prompt user about long-running task
+do_long_running_prompt() {
+    local current_task
+    current_task=$(get_current_task)
+    local duration
+    duration=$(get_current_elapsed)
+    local hours=$((duration / 60))
+    local mins=$((duration % 60))
+    
+    local result
+    result=$(zenity --question \
+        --title="WorkPulse - Long Running Task" \
+        --text="Your task '$current_task' has been running for ${hours}h ${mins}m.\n\nDo you want to continue this task?" \
+        --ok-label="Continue" \
+        --cancel-label="Stop & Log" \
+        --width=400 \
+        --height=150 \
+        2>/dev/null)
+    
+    local exit_code=$?
+    
+    if [[ $exit_code -eq 0 ]]; then
+        # Continue
+        log_info "User chose to continue long-running task: $current_task"
+        set_state "last_long_running_prompt" "$current_task"
+    else
+        # Stop and prompt for new task
+        log_info "User chose to stop long-running task: $current_task"
+        timew_stop
+        set_state "current_task" ""
+        # Trigger a regular prompt
+        do_prompt
+    fi
+}
+
+# Main daemon loop
+main_loop() {
+    log_info "Starting main daemon loop"
+    
+    while [[ "$RUNNING" == "true" ]]; do
+        # Wrap loop body in error handling to prevent exit on non-critical errors
+        {
+            # Check if we're at work start
+            check_work_start || true
+            
+            # Check if we're at work end
+            check_work_end || true
+            
+            # Update work hour tracking
+            update_work_hours || true
+            
+            # Check if prompt is due
+            if check_prompt_due; then
+                log_info "Prompt is due, triggering..."
+                
+                if ! do_prompt; then
+                    log_warn "Prompt was dismissed or cancelled"
+                    # Check for force mode
+                    check_force_mode || true
+                fi
+            fi
+            
+            # Check if current task has been running for more than 1 hour
+            if check_long_running_task; then
+                log_info "Long-running task detected, prompting..."
+                do_long_running_prompt || true
+            fi
+            
+            # Periodic force mode check (in case prompts were missed)
+            check_force_mode || true
+            
+        } || log_warn "Error in main loop iteration, continuing..."
+        
+        # Sleep until next check
+        sleep "$LOOP_INTERVAL" || true
+    done
+    
+    log_info "Main loop exited"
+}
+
+# ============================================================================
+# DAEMON LIFECYCLE
+# ============================================================================
+
+# Initialize daemon
+daemon_init() {
+    log_info "Initializing $DAEMON_NAME v$DAEMON_VERSION"
+    
+    # Common initialization
+    common_init
+    
+    # Check dependencies
+    if ! check_dependencies; then
+        log_error "Dependency check failed"
+        exit 1
+    fi
+    
+    # Check if already running
+    if is_daemon_running; then
+        local existing_pid=$(get_daemon_pid)
+        log_error "Daemon already running with PID $existing_pid"
+        echo "Error: WorkPulse daemon is already running (PID: $existing_pid)"
+        echo "Use 'workpulse stop' to stop it first."
+        exit 1
+    fi
+    
+    # Initialize database
+    init_database
+    
+    # Set up signal handlers
+    trap handle_sigterm SIGTERM SIGINT
+    trap handle_sighup SIGHUP
+    trap handle_sigusr1 SIGUSR1
+    trap handle_sigusr2 SIGUSR2
+    
+    # Set up cleanup
+    trap 'daemon_cleanup' EXIT
+    
+    # Write PID file
+    write_pid_file
+    
+    log_info "Daemon initialized successfully"
+}
+
+# Cleanup on exit
+daemon_cleanup() {
+    log_info "Cleaning up daemon..."
+    
+    # Stop IPC server
+    stop_ipc_server
+    
+    # Stop any tracking
+    timew_stop 2>/dev/null || true
+    
+    # Emergency unlock if force mode was active
+    if is_force_lock_active; then
+        emergency_unlock
+    fi
+    
+    # Remove PID file
+    remove_pid_file
+    
+    log_info "Daemon cleanup complete"
+}
+
+# Start daemon in foreground (for systemd)
+start_foreground() {
+    daemon_init
+    
+    # Start IPC server
+    start_ipc_server
+    
+    log_info "Daemon starting in foreground mode"
+    
+    # Run main loop
+    main_loop
+    
+    log_info "Daemon stopped"
+}
+
+# Start daemon in background
+start_background() {
+    daemon_init
+    
+    log_info "Daemon starting in background mode"
+    
+    # Fork to background
+    (
+        # Start IPC server
+        start_ipc_server
+        
+        # Run main loop
+        main_loop
+    ) &
+    
+    local bg_pid=$!
+    echo "$bg_pid" > "${PID_FILE:-$DEFAULT_PID_FILE}"
+    
+    echo "WorkPulse daemon started with PID $bg_pid"
+    log_info "Daemon backgrounded with PID $bg_pid"
+}
+
+# Stop running daemon
+stop_daemon() {
+    if is_daemon_running; then
+        local pid=$(get_daemon_pid)
+        log_info "Stopping daemon (PID: $pid)"
+        
+        kill -TERM "$pid" 2>/dev/null || true
+        
+        # Wait for graceful shutdown
+        local count=0
+        while kill -0 "$pid" 2>/dev/null && (( count < 10 )); do
+            sleep 1
+            ((count++))
+        done
+        
+        # Force kill if still running
+        if kill -0 "$pid" 2>/dev/null; then
+            log_warn "Forcing daemon termination"
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        
+        remove_pid_file
+        echo "Daemon stopped"
+    else
+        echo "Daemon is not running"
+    fi
+}
+
+# Show daemon status
+daemon_status() {
+    if is_daemon_running; then
+        local pid=$(get_daemon_pid)
+        echo "WorkPulse daemon is running (PID: $pid)"
+        echo ""
+        show_status
+    else
+        echo "WorkPulse daemon is not running"
+        exit 1
+    fi
+}
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
+print_usage() {
+    cat << EOF
+Usage: $DAEMON_NAME [command]
+
+Commands:
+    start       Start daemon in background
+    foreground  Start daemon in foreground (for systemd)
+    stop        Stop running daemon
+    restart     Restart daemon
+    status      Show daemon status
+    
+If no command is given, starts in foreground mode.
+
+Signals:
+    SIGTERM     Graceful shutdown
+    SIGHUP      Reload configuration
+    SIGUSR1     Trigger immediate prompt
+    SIGUSR2     Print status to log
+EOF
+}
+
+main() {
+    local cmd="${1:-foreground}"
+    
+    case "$cmd" in
+        start)
+            start_background
+            ;;
+        foreground|--foreground|-f)
+            start_foreground
+            ;;
+        stop)
+            stop_daemon
+            ;;
+        restart)
+            stop_daemon
+            sleep 2
+            start_background
+            ;;
+        status)
+            daemon_status
+            ;;
+        -h|--help|help)
+            print_usage
+            ;;
+        *)
+            echo "Unknown command: $cmd"
+            print_usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
