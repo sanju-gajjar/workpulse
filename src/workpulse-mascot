@@ -93,6 +93,8 @@ class WorkPulseMascot(Gtk.Window):
         self.is_tracking = False
         self.is_paused = False
         self.today_hours = 0
+        self.today_hours_tracked = 0  # Track our own logged hours
+        self.last_check_date = None  # Track date for midnight reset
         self.current_task = ""
         self.task_start_time = None
         self.elapsed_seconds = 0
@@ -134,7 +136,7 @@ class WorkPulseMascot(Gtk.Window):
         # Git activity monitor
         self.git_monitor = GitActivityMonitor()
         
-        # Sleepy mode tracking
+        # Sleepy mode tracking (DISABLED)
         self.idle_start_time = time.time()
         self.sleepy_threshold = 600  # 10 minutes idle = sleepy mode
         self.is_sleepy = False
@@ -156,6 +158,8 @@ class WorkPulseMascot(Gtk.Window):
         # The mascot character
         self.mascot = MascotCharacter(self.mascot_theme)
         self.mascot.tamagotchi = True
+        # Explicitly ensure mascot is awake (disable sleep mode)
+        self.mascot.set_sleepy(False)
         
         # Set window size (bigger for character + speech bubble)
         self.set_size_request(self.size + 80, self.size + self.bubble_height + 30)
@@ -214,9 +218,11 @@ class WorkPulseMascot(Gtk.Window):
         GLib.timeout_add(300000, self.check_break_reminder)
         GLib.timeout_add(30000, self.check_git_activity)  # Check git every 30s
         GLib.timeout_add(60000, self.check_eod_reminder)  # Check EOD every minute
-        GLib.timeout_add(30000, self.check_sleepy_mode)   # Check sleepy every 30s
+        # GLib.timeout_add(30000, self.check_sleepy_mode)   # DISABLED - no sleep mode
         GLib.timeout_add(5000, self.ensure_on_top)  # Keep window on top every 5s
         GLib.timeout_add(10000, self.check_meeting_call)  # Check for meeting calls every 10s
+        #GLib.timeout_add(60000, self.hourly_task_dialog)  # Every minute (for testing)
+        GLib.timeout_add(7200000, self.hourly_task_dialog)  # Every 2 hours
         
         self.update_status()
         self.show_all()
@@ -838,6 +844,10 @@ class WorkPulseMascot(Gtk.Window):
         badge_x = width / 2
         badge_y = height - 12
         
+        # Safety check for NaN
+        if not isinstance(self.today_hours, (int, float)) or self.today_hours != self.today_hours:
+            self.today_hours = 0
+        
         hours = int(self.today_hours)
         mins = int((self.today_hours - hours) * 60)
         
@@ -1237,14 +1247,17 @@ class WorkPulseMascot(Gtk.Window):
                 self.continuous_work_start = None
                 self.mascot.change_random_state(False, False)
             
-            for line in status.split('\n'):
-                if "Today's Total:" in line:
-                    time_str = line.split("Today's Total:")[-1].strip()
-                    try:
-                        self.today_hours = float(time_str.split()[0])
-                    except:
-                        self.today_hours = 0
-                    break
+            # Reset hours if new day
+            import datetime
+            current_date = datetime.date.today()
+            if self.last_check_date is None:
+                self.last_check_date = current_date
+            elif current_date != self.last_check_date:
+                self.today_hours_tracked = 0
+                self.last_check_date = current_date
+            
+            # Use our own tracked hours instead of broken workpulse status
+            self.today_hours = self.today_hours_tracked
         except:
             pass
         
@@ -1636,6 +1649,366 @@ class WorkPulseMascot(Gtk.Window):
                 self.notify("WorkPulse", "No report found. Make sure you have tracked time today.")
         except Exception as e:
             self.notify("WorkPulse", f"Error: {str(e)}")
+
+    def hourly_task_dialog(self):
+        """Single popup every 2 hours - clean UX, no multi-step nonsense"""
+        import threading
+        def show_dialog():
+            try:
+                import subprocess
+                import os
+                
+                # Get tickets
+                tickets = self.get_clickup_tickets()
+                if not tickets:
+                    subprocess.run([
+                        "zenity", "--error", "--title=WorkPulse",
+                        "--text=No ClickUp tickets found.\nCheck ~/.config/workpulse/config",
+                        "--timeout=10"
+                    ])
+                    return
+                
+                # Load last selected ticket (smart default)
+                state_file = os.path.expanduser("~/.local/share/workpulse/last_ticket.txt")
+                last_ticket = ""
+                if os.path.exists(state_file):
+                    with open(state_file) as f:
+                        last_ticket = f.read().strip()
+                
+                # Build ticket list for zenity (last ticket first if exists)
+                ticket_list = []
+                if last_ticket and last_ticket in tickets:
+                    ticket_list.append(last_ticket)
+                    ticket_list.extend([t for t in tickets if t != last_ticket][:9])  # Top 9 others
+                else:
+                    ticket_list = tickets[:10]  # Top 10
+                
+                # Clean display: show only "DISPLAY_ID: Name" (hide |REAL_ID)
+                display_list = [t.replace('|', ' ').split(': ')[0] + ': ' + ': '.join(t.split(': ')[1:]) if '|' in t else t for t in ticket_list]
+                
+                # Show single dialog with timeout
+                result = subprocess.run([
+                    "zenity", "--list",
+                    "--title=🕑 Quick check-in: last 2 hours",
+                    "--text=Select ticket you worked on:",
+                    "--column=Ticket", *display_list,
+                    "--height=350", "--width=650",
+                    "--ok-label=✅ Next",
+                    "--extra-button=⏰ Snooze 15min",
+                    "--extra-button=❌ Skip",
+                    "--timeout=10"
+                ], capture_output=True, text=True)
+                
+                # Handle buttons
+                if result.returncode == 1 or result.stdout.strip() == "" or "Skip" in result.stderr:
+                    print("User skipped")
+                    return
+                
+                if "Snooze" in result.stderr:
+                    print("Snoozed for 15 min")
+                    GLib.timeout_add(900000, self.hourly_task_dialog)  # 15 min
+                    return
+                
+                selected_ticket = result.stdout.strip()
+                if not selected_ticket:
+                    return
+                
+                # Find the original ticket entry with real ID
+                matched_ticket = None
+                for t in ticket_list:
+                    if t.replace('|', ' ').split(': ')[0] + ': ' + ': '.join(t.split(': ')[1:]) if '|' in t else t == selected_ticket:
+                        matched_ticket = t
+                        break
+                
+                if not matched_ticket:
+                    matched_ticket = selected_ticket
+                
+                # Save as last ticket
+                os.makedirs(os.path.dirname(state_file), exist_ok=True)
+                with open(state_file, "w") as f:
+                    f.write(matched_ticket)
+                
+                # Extract real task ID (format: "DISPLAY|REAL: Name" or "ID: Name")
+                if '|' in matched_ticket:
+                    parts = matched_ticket.split('|')
+                    display_id = parts[0]
+                    real_id = parts[1].split(':')[0].strip()
+                else:
+                    # Fallback: no pipe separator
+                    real_id = matched_ticket.split(':')[0].strip()
+                    display_id = real_id
+                
+                # Quick form for time/work/blocker with validation
+                minutes = None
+                while minutes is None:
+                    form_result = subprocess.run([
+                        "zenity", "--forms",
+                        "--title=🕑 Quick check-in: last 2 hours",
+                        "--text=Ticket: " + display_id + (': ' + matched_ticket.split(': ', 1)[1] if ': ' in matched_ticket else '')[:60],
+                        "--add-entry=Time spent (minutes - numbers only)",
+                        "--add-entry=Work done (optional)",
+                        "--add-entry=Blocker (if any)",
+                        "--forms-date-format=%Y-%m-%d",
+                        "--separator=|",
+                        "--width=550"
+                    ], input="120\n\n", text=True, capture_output=True)
+                    
+                    if form_result.returncode != 0:
+                        print("User cancelled form")
+                        return
+                    
+                    # Parse form
+                    parts = form_result.stdout.strip().split('|')
+                    time_spent = parts[0] if len(parts) > 0 else "120"
+                    work_done = parts[1] if len(parts) > 1 else ""
+                    blocker = parts[2] if len(parts) > 2 else ""
+                    
+                    # Validate time - must be positive integer
+                    try:
+                        minutes = int(time_spent)
+                        if minutes <= 0:
+                            subprocess.run([
+                                "zenity", "--error",
+                                "--title=Invalid Time",
+                                "--text=Please enter a positive number for minutes.\nExample: 120 (for 2 hours)",
+                                "--width=300"
+                            ])
+                            minutes = None
+                    except ValueError:
+                        subprocess.run([
+                            "zenity", "--error",
+                            "--title=Invalid Time Format",
+                            "--text=Please enter only numbers for time.\n\nExamples:\n  60 = 1 hour\n  120 = 2 hours\n  90 = 1.5 hours",
+                            "--width=300"
+                        ])
+                        minutes = None
+                
+                # Save locally (use display_id for readability)
+                self.save_hourly_log(display_id, minutes, work_done, blocker, matched_ticket)
+                
+                # Log to ClickUp (use real_id for API)
+                success = self.log_to_clickup(real_id, minutes, work_done, blocker)
+                
+                # Update today's tracked hours
+                if success:
+                    self.today_hours_tracked += minutes / 60.0
+                
+                # Quick success notification (no blocking dialog)
+                if success:
+                    subprocess.run([
+                        "notify-send", "WorkPulse",
+                        f"✓ Logged {minutes}min to {display_id}",
+                        "-t", "3000"
+                    ])
+                    
+            except Exception as e:
+                print(f"Dialog error: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        thread = threading.Thread(target=show_dialog, daemon=True)
+        thread.start()
+        return True
+
+    def save_hourly_log(self, ticket_id, minutes, work_done, blocker, full_ticket_name):
+        """Save work log locally"""
+        import datetime
+        log_entry = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "ticket_id": ticket_id,
+            "ticket_name": full_ticket_name,
+            "minutes": minutes,
+            "work_done": work_done,
+            "blocker": blocker
+        }
+        try:
+            log_file = os.path.expanduser("~/.local/share/workpulse/hourly_logs.json")
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            logs = []
+            if os.path.exists(log_file):
+                with open(log_file, "r") as f:
+                    import json
+                    logs = json.load(f)
+            logs.append(log_entry)
+            with open(log_file, "w") as f:
+                import json
+                json.dump(logs, f, indent=2)
+        except Exception as e:
+            print(f"Error saving hourly log: {e}")
+
+    def get_clickup_tickets(self):
+        """Return list of ClickUp tickets assigned to configured user using direct ClickUp API calls (no external script dependency)"""
+        import os
+        try:
+            import requests
+        except ImportError:
+            print("requests module not installed. Install with: pip install requests")
+            return []
+        
+        api_token = None
+        team_id = None
+        user_id = None
+        # Load config from ~/.config/workpulse/config
+        config_path = os.path.expanduser("~/.config/workpulse/config")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                for line in f:
+                    if line.startswith("CLICKUP_API_TOKEN="):
+                        api_token = line.strip().split('=',1)[1].strip('"')
+                    if line.startswith("CLICKUP_TEAM_ID="):
+                        team_id = line.strip().split('=',1)[1].strip('"')
+                    if line.startswith("CLICKUP_USER_ID="):
+                        user_id = line.strip().split('=',1)[1].strip('"')
+        
+        if not api_token or not team_id:
+            print("ClickUp API token or Team ID not configured.")
+            return []
+        
+        if not user_id:
+            print("ClickUp User ID not configured. Add CLICKUP_USER_ID to config.")
+            return []
+        
+        try:
+            # Get all spaces for the team
+            headers = {"Authorization": api_token}
+            spaces_resp = requests.get(f"https://api.clickup.com/api/v2/team/{team_id}/space", headers=headers, timeout=10)
+            if spaces_resp.status_code != 200:
+                print(f"Failed to fetch spaces from ClickUp. Status: {spaces_resp.status_code}")
+                return []
+            
+            spaces = spaces_resp.json().get('spaces',[])
+            
+            # Find all lists in all spaces
+            list_ids = []
+            for space in spaces:
+                space_id = space.get('id')
+                lists_resp = requests.get(f"https://api.clickup.com/api/v2/space/{space_id}/list", headers=headers, timeout=10)
+                if lists_resp.status_code == 200:
+                    for lst in lists_resp.json().get('lists',[]):
+                        list_ids.append(lst.get('id'))
+            
+            # Fetch tasks assigned to configured user from all lists
+            tickets = []
+            for list_id in list_ids:
+                tasks_resp = requests.get(f"https://api.clickup.com/api/v2/list/{list_id}/task?include_closed=false&subtasks=true", headers=headers, timeout=10)
+                if tasks_resp.status_code == 200:
+                    for task in tasks_resp.json().get('tasks',[]):
+                        for assignee in task.get('assignees',[]):
+                            if str(assignee.get('id')) == user_id:
+                                # Store both display format and real ID
+                                real_id = task.get('id')
+                                display_id = task.get('custom_id') or real_id
+                                name = task.get('name','')
+                                # Format: "DISPLAY_ID|REAL_ID: Name"
+                                tickets.append(f"{display_id}|{real_id}: {name}")
+                                break  # Found assignee, move to next task
+            
+            return tickets
+        except Exception as e:
+            print(f"Error fetching ClickUp tickets: {e}")
+            return []
+
+    def log_to_clickup(self, ticket_id, minutes, work_done, blocker):
+        """Log time to ClickUp using proper API endpoint. Only add comment if work_done or blocker exists."""
+        import os
+        import time as time_module
+        try:
+            import requests
+        except ImportError:
+            print("requests module not installed")
+            return False
+        
+        # Load config
+        api_token = None
+        team_id = None
+        config_path = os.path.expanduser("~/.config/workpulse/config")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                for line in f:
+                    if line.startswith("CLICKUP_API_TOKEN="):
+                        api_token = line.strip().split('=',1)[1].strip('"')
+                    if line.startswith("CLICKUP_TEAM_ID="):
+                        team_id = line.strip().split('=',1)[1].strip('"')
+        
+        if not api_token or not team_id:
+            print("ClickUp API token or Team ID not configured")
+            return False
+        
+        headers = {
+            "Authorization": api_token,
+            "Content-Type": "application/json"
+        }
+        
+        try:
+            # If ticket_id looks like custom_id (e.g., contains letters), lookup real ID
+            real_task_id = ticket_id
+            if not ticket_id.isdigit():
+                # Try to get task by custom_id
+                task_resp = requests.get(
+                    f"https://api.clickup.com/api/v2/task/{ticket_id}?custom_task_ids=true&team_id={team_id}",
+                    headers=headers,
+                    timeout=10
+                )
+                if task_resp.status_code == 200:
+                    real_task_id = task_resp.json().get('id')
+                    print(f"✓ Resolved {ticket_id} → {real_task_id}")
+                else:
+                    print(f"Failed to resolve custom task ID: {task_resp.status_code}")
+                    # Try using as-is
+            
+            # Calculate timestamps (ClickUp requires milliseconds)
+            duration_ms = int(minutes * 60 * 1000)
+            end_time_ms = int(time_module.time() * 1000)
+            start_time_ms = end_time_ms - duration_ms
+            
+            # Time entry data - using correct ClickUp API format
+            time_data = {
+                "tid": real_task_id,
+                "start": start_time_ms,
+                "duration": duration_ms,
+                "description": work_done[:100] if work_done else ""
+            }
+            
+            print(f"Logging time: {minutes}min to task {real_task_id}")
+            
+            # Use correct endpoint: /team/{team_id}/time_entries
+            time_resp = requests.post(
+                f"https://api.clickup.com/api/v2/team/{team_id}/time_entries",
+                headers=headers,
+                json=time_data,
+                timeout=10
+            )
+            
+            if time_resp.status_code not in [200, 201]:
+                print(f"Failed to log time: {time_resp.status_code}")
+                print(f"Response: {time_resp.text}")
+                return False
+            
+            print(f"✓ {minutes}min logged to {ticket_id}")
+            
+            # Only add comment if there's actual work_done content
+            if work_done and work_done.strip():
+                comment_text = work_done.strip()
+                
+                # Only append blocker if it has meaningful content (not "Na", "N/A", empty, etc)
+                if blocker and blocker.strip() and blocker.strip().lower() not in ['na', 'n/a', 'no', 'none', '-']:
+                    comment_text += f"\n\nBlocker: {blocker.strip()}"
+                
+                comment_resp = requests.post(
+                    f"https://api.clickup.com/api/v2/task/{ticket_id}/comment",
+                    headers=headers,
+                    json={"comment_text": comment_text},
+                    timeout=10
+                )
+                
+                if comment_resp.status_code in [200, 201]:
+                    print(f"✓ Comment added")
+            
+            return True
+                
+        except Exception as e:
+            print(f"Error logging to ClickUp: {e}")
+            return False
 
 def main():
     signal.signal(signal.SIGINT, signal.SIG_DFL)

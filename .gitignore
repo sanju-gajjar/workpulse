@@ -8,6 +8,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+workpulse-clickup
 build/
 develop-eggs/
 dist/

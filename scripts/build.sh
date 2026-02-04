@@ -214,11 +214,24 @@ build_deb() {
     # Autostart for mascot (replaces tray)
     cp "$PROJECT_DIR/desktop/workpulse-mascot.desktop" "$deb_root/etc/xdg/autostart/"
     
-    # Update library paths in executables
-    sed -i 's|LIB_DIR="\$INSTALL_DIR/lib"|LIB_DIR="/usr/share/workpulse/lib"|' \
-        "$deb_root/usr/bin/workpulse"
+    # Update library paths in executables for system-wide installation
+    # For workpulse: Replace the if/else lib detection with system path
+    sed -i '/# Source libraries (check both possible locations)/,/^fi$/{
+        /# Source libraries (check both possible locations)/c\
+# Source libraries from system installation\
+LIB_DIR="/usr/share/workpulse/lib"
+        /^if \[\[/d
+        /LIB_DIR=/d
+        /else$/d
+        /Fallback for installed version/d
+        /^fi$/d
+    }' "$deb_root/usr/bin/workpulse"
+    
+    # For workpulsed: Simple string replacement
     sed -i 's|LIB_DIR="\$INSTALL_DIR/lib"|LIB_DIR="/usr/share/workpulse/lib"|' \
         "$deb_root/usr/bin/workpulsed"
+    
+    # workpulse-clickup already has correct paths - no modification needed
     
     chmod +x "$deb_root/usr/bin/workpulse"
     chmod +x "$deb_root/usr/bin/workpulsed"
