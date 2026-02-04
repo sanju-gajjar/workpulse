@@ -136,11 +136,6 @@ class WorkPulseMascot(Gtk.Window):
         # Git activity monitor
         self.git_monitor = GitActivityMonitor()
         
-        # Sleepy mode tracking (DISABLED)
-        self.idle_start_time = time.time()
-        self.sleepy_threshold = 600  # 10 minutes idle = sleepy mode
-        self.is_sleepy = False
-        
         # End of day reminder
         self.eod_reminded_today = False
         self.last_eod_check_date = None
@@ -158,8 +153,6 @@ class WorkPulseMascot(Gtk.Window):
         # The mascot character
         self.mascot = MascotCharacter(self.mascot_theme)
         self.mascot.tamagotchi = True
-        # Explicitly ensure mascot is awake (disable sleep mode)
-        self.mascot.set_sleepy(False)
         
         # Set window size (bigger for character + speech bubble)
         self.set_size_request(self.size + 80, self.size + self.bubble_height + 30)
@@ -261,10 +254,6 @@ class WorkPulseMascot(Gtk.Window):
         """Callback when a system notification is received"""
         if self.show_system_notifications:
             self.speech_bubble.set_message(text)
-            # Wake up if sleepy
-            if self.is_sleepy:
-                self.is_sleepy = False
-                self.mascot.set_sleepy(False)
     
     def load_settings(self):
         """Load personalization settings"""
@@ -921,7 +910,6 @@ class WorkPulseMascot(Gtk.Window):
                 # When not tracking, show variety of moves
                 states = [
                     MascotCharacter.IDLE,
-                    MascotCharacter.SLEEPING,
                     MascotCharacter.WAVING,
                     MascotCharacter.JUMPING
                 ]
@@ -977,12 +965,6 @@ class WorkPulseMascot(Gtk.Window):
                 self.speech_bubble.set_message(message)
                 self.mascot.state = MascotCharacter.CELEBRATING
                 self.mascot.state_timer = 0
-                
-                # Wake up if sleepy
-                if self.is_sleepy:
-                    self.is_sleepy = False
-                    self.mascot.set_sleepy(False)
-                    self.idle_start_time = time.time()
         except:
             pass
         return True
@@ -1012,11 +994,6 @@ class WorkPulseMascot(Gtk.Window):
                                f"Hey {self.user_name}! Time to export your standup report.\n"
                                "Click me → Standup Report to copy your logs!")
                     
-                    # Wake up if sleepy
-                    if self.is_sleepy:
-                        self.is_sleepy = False
-                        self.mascot.set_sleepy(False)
-                    
                     self.mascot.state = MascotCharacter.WAVING
                     self.mascot.state_timer = 0
             
@@ -1042,11 +1019,6 @@ class WorkPulseMascot(Gtk.Window):
                     # Show the message
                     self.speech_bubble.set_message(f"⏰ {reminder_msg}")
                     self.notify(f"⏰ Reminder", reminder_msg)
-                    
-                    # Wake up if sleepy
-                    if self.is_sleepy:
-                        self.is_sleepy = False
-                        self.mascot.set_sleepy(False)
                     
                     self.mascot.state = MascotCharacter.WAVING
                     self.mascot.state_timer = 0
@@ -1127,31 +1099,6 @@ class WorkPulseMascot(Gtk.Window):
         except:
             pass
         
-        return True
-    
-    def check_sleepy_mode(self):
-        """Check if mascot should enter sleepy mode"""
-        try:
-            # Check system idle time
-            result = subprocess.run(['xprintidle'], capture_output=True, text=True, timeout=2)
-            idle_ms = int(result.stdout.strip())
-            idle_seconds = idle_ms / 1000
-            
-            # If idle for too long and not tracking, enter sleepy mode
-            if idle_seconds > self.sleepy_threshold and not self.is_tracking:
-                if not self.is_sleepy:
-                    self.is_sleepy = True
-                    self.mascot.set_sleepy(True)
-                    sleepy_msg = self.speech_bubble.force_message("sleepy")
-                    self.speech_bubble.set_message(sleepy_msg)
-            else:
-                # Wake up
-                if self.is_sleepy:
-                    self.is_sleepy = False
-                    self.mascot.set_sleepy(False)
-                    self.idle_start_time = time.time()
-        except:
-            pass
         return True
     
     def auto_pause(self):

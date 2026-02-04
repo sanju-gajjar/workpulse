@@ -21,7 +21,7 @@ class State(Enum):
     RUNNING = auto()
     JUMPING = auto()
     WAVING = auto()
-    SLEEPING = auto()
+    # SLEEPING removed - not needed
     CELEBRATING = auto()
     EXCITED = auto()
     CONFUSED = auto()
@@ -148,7 +148,7 @@ STATE_POOLS = {
     ],
 }
 
-CLOSED_EYES = {State.SLEEPING, State.TIRED}
+CLOSED_EYES = {State.TIRED}
 WIDE_EYES = {State.SHOCKED, State.EXCITED}
 HAPPY_EYES = {State.HAPPY, State.CELEBRATING}
 
@@ -208,7 +208,7 @@ class MascotCharacter:
     RUNNING = State.RUNNING
     JUMPING = State.JUMPING
     WAVING = State.WAVING
-    SLEEPING = State.SLEEPING
+    # SLEEPING = State.SLEEPING  # REMOVED
     CELEBRATING = State.CELEBRATING
     EXCITED = State.EXCITED
     CONFUSED = State.CONFUSED
@@ -243,8 +243,10 @@ class MascotCharacter:
         self.spec = THEMES.get(theme, THEMES["elephant"])
 
     def set_sleepy(self, sleepy):
-        self.sleepy = sleepy
-        self.state = State.SLEEPING if sleepy else State.IDLE
+        # DISABLED - sleep mode removed
+        self.sleepy = False  # Always keep awake
+        if self.state == State.IDLE:  # Don't change if doing something
+            self.state = State.IDLE
         self.state_timer = 0
 
     def change_random_state(self, is_tracking=False, is_paused=False):
@@ -437,11 +439,7 @@ class MascotCharacter:
             cr.set_font_size(16*s)
             cr.move_to(cx + 25*s, cy - 30*s)
             cr.show_text("?")
-        elif self.state in (State.SLEEPING, State.TIRED):
-            for i, (fs, xo, yo) in enumerate([(10,20,-25),(12,28,-32),(14,36,-40)]):
-                cr.set_font_size(fs*s)
-                cr.move_to(cx + xo*s, cy + yo*s)
-                cr.show_text("z" if i < 2 else "Z")
+        # Sleep/zzz animation removed - no sleeping mode
     def brain_tick(self):
         if not self.tamagotchi:
             return
@@ -451,9 +449,9 @@ class MascotCharacter:
         self.energy = max(0.0, self.energy - 0.0008)
         self.boredom = min(1.0, self.boredom + 0.0006)
 
-        # hard overrides
+        # hard overrides - but never sleep
         if self.energy < 0.2:
-            self.state = State.SLEEPING
+            self.state = State.TIRED  # Just tired, not sleeping
             return
 
         if self.hunger > 0.85:
