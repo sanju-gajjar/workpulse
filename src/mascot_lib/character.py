@@ -143,8 +143,8 @@ STATE_POOLS = {
         State.CELEBRATING, State.EXCITED, State.DANCING
     ],
     "paused": [
-        State.SLEEPING, State.THINKING,
-        State.IDLE, State.TIRED, State.MEDITATING
+        State.IDLE, State.THINKING,
+        State.TIRED, State.MEDITATING, State.CONFUSED
     ],
 }
 
@@ -197,7 +197,7 @@ class MascotCharacter:
 
     bounce: float = 0.0
     bounce_dir: int = 1
-    sleepy: bool = False
+    sleepy: bool = False  # DISABLED - never sleep
 
     spec: MascotSpec = field(init=False)
     
@@ -286,9 +286,10 @@ class MascotCharacter:
         self.state_timer = 0
         self.state_duration = random.randint(80, 200)
 
-        if self.sleepy:
-            self.state = State.SLEEPING
-            return
+        # SLEEP MODE DISABLED - never enter sleeping state
+        # if self.sleepy:
+        #     self.state = State.SLEEPING
+        #     return
 
         key = "paused" if paused else "tracking" if tracking else "idle"
         self.state = random.choice(STATE_POOLS[key])
